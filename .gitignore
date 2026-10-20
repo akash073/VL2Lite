@@ -1,0 +1,8 @@
+*.json
+data/**/*
+fingerprinting/models/___pycache__/**/*
+*.xlsx
+
+cub200_vl2lite_mle_results/
+fmnist_vl2lite_mle_results/
+fmnist_vl2lite_mle_results run 1/
