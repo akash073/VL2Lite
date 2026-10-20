@@ -7,6 +7,8 @@ in particular for geometry-preserving distillation (VL2Lite)?
 
 Smoke:  python fmnist_vl2lite_mle_pareto.py --max-train 2000 --max-test 500 --epochs 2 \
             --seeds 42 --dims mle,full --benchmark-repeats 30 --id-samples 1000 --gpus 0
+
+    #   python fmnist_vl2lite_mle_pareto_v3.py --epochs 5 --seeds 42 --gpus 0
 Full:   python fmnist_vl2lite_mle_pareto_fixed.py --epochs 50 --seeds 42,43,44 --gpus 0,1 --num-workers 4
 """
 

@@ -1,15 +1,42 @@
-"""VL2Lite + Levina-Bickel MLE bottleneck — SVHN edition (v4, research corrections).
+"""VL2Lite-style KD + Levina-Bickel MLE bottleneck — SVHN edition (v5).
 
 RQ1: Does the Levina-Bickel MLE estimate of CLIP vision-embedding intrinsic
 dimensionality predict where the student bottleneck stops limiting accuracy,
-in particular for geometry-preserving distillation (VL2Lite)?
+in particular for geometry-preserving distillation?
 
+v5 corrections to v4 (see R-tags in code)
+  R1  --kd-logit-scale defaulted to a fixed 10. With T=2 that makes CLIP's teacher
+      distribution nearly uniform (0.155 on the top class in a clear case, 0.114
+      for a weak teacher), so the linguistic loss again carried almost no class
+      signal -- the v3 FIX-2 problem returned. Default is now CLIP's own learned
+      logit scale; an explicit value can still be passed for an ablation, and the
+      scale actually used is saved.
+  R2  The resume signature included seeds/dims/modes, so adding seeds 43,44 to a
+      finished seed-42 run was refused. Only per-run TRAINING settings are in the
+      signature now; each run's tag already encodes mode, d and seed.
+  R3  Data subsampling and the MLE estimate used seeds[0]. Resuming with a
+      different seed list could change mle_d and therefore the whole d grid.
+      They now use a fixed --data-seed, independent of training seeds.
+  R4  d = full uses no bottleneck layer (identity), as in v4, but this is now
+      recorded per row (has_bottleneck_layer) so the architecture change at
+      d = full is visible in every results table.
+  R5  Docstring commands referred to other file names.
 
-Smoke:  python svhn_vl2lite_mle_pareto_fixed.py --max-train 2000 --max-test 500 --epochs 2 \
+Comparability warning: v4/v5 settings (lam_cls_start=0.5, final-epoch-only test,
+identity at full d, 50 epochs) differ from the v3 runs behind the earlier CIFAR-10,
+FMNIST and SVHN tables. Re-run all three datasets with identical v5 settings before
+comparing them in a paper.
+
+Requires: pip install torch torchvision open_clip_torch scikit-learn pandas numpy scipy pynvml
+
+Smoke:  python svhn_vl2lite_mle_pareto_v5.py --max-train 2000 --max-test 500 --epochs 2 \
             --seeds 42 --dims mle,full --benchmark-repeats 30 --id-samples 1000 --gpus 0
 
-        python svhn_vl2lite_mle_pareto_v3.py --epochs 5 --seeds 42 --gpus 0
-Full:   python svhn_vl2lite_mle_pareto_fixed.py --epochs 50 --seeds 42,43,44 --gpus 0,1 --num-workers 4
+        python svhn_vl2lite_mle_pareto_v3.py --epochs 5 --seeds 42 --gpus 1
+
+        
+Full:   python svhn_vl2lite_mle_pareto_v5.py --epochs 50 --seeds 42,43,44 --gpus 0,1 --num-workers 2
+Add seeds later:  same command with --seeds 42,43,44 --resume
 """
 
 import argparse
@@ -31,14 +58,21 @@ from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, models, transforms
 
-# SV-1: torchvision maps SVHN's original label 10 to 0, so index == digit
+# torchvision maps SVHN's original label 10 to 0, so index == digit
 SVHN_CLASSES = [str(i) for i in range(10)]
 PROMPT_NAMES = SVHN_CLASSES
-# SV-3: CLIP-style digit template ensemble
 PROMPT_TEMPLATES = ['a photo of the number: "{}".', 'a photo of the house number "{}".',
                     'a street view photo of the digit {}.', 'a blurry photo of the number {}.']
 NUM_CLASSES = 10
 BACKBONE_DIM = {'resnet18': 512, 'mobilenet_v2': 1280}
+
+# R2: settings that change how an individual run is trained. Seeds, dims and modes
+# only choose WHICH runs exist (encoded in each tag), so they are not included.
+SIGNATURE_FIELDS = ['teacher', 'pretrained', 'student', 'no_pretrained_student',
+                    'use_extra', 'max_train', 'max_test', 'data_seed', 'epochs',
+                    'batch_size', 'lr', 'temperature', 'lam_cls_start', 'lam_cls_end',
+                    'kd_logit_scale', 'w_mse', 'w_cos', 'w_consistency',
+                    'id_samples', 'id_ks']
 
 
 def seed_everything(s: int) -> None:
@@ -55,6 +89,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--use-extra', action='store_true', help='Include SVHN extra split in training')
     p.add_argument('--max-train', type=int, default=0)
     p.add_argument('--max-test', type=int, default=0)
+    p.add_argument('--data-seed', type=int, default=42,
+                   help='R3: seed for subsampling and the MLE estimate (independent of training seeds)')
     p.add_argument('--teacher', default='ViT-B-32')
     p.add_argument('--pretrained', default='laion2b_s34b_b79k')
     p.add_argument('--student', choices=list(BACKBONE_DIM), default='resnet18')
@@ -62,10 +98,9 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--id-samples', type=int, default=5000)
     p.add_argument('--id-ks', type=int, nargs='+', default=[5, 10, 20, 50])
     p.add_argument('--id-repeats', type=int, default=5,
-                   help='SV-7: MLE repeats on different random subsamples')
-    # FM-5: grid relative to the MLE estimate
+                   help='MLE repeats on different random subsamples')
     p.add_argument('--dims', default='8,mle*0.5,mle*0.75,mle,mle*1.25,mle*1.5,32,128,full',
-                   help="Tokens: integer, 'mle', 'mle*<factor>', 'full' (= backbone dim).")
+                   help="Tokens: integer, 'mle', 'mle*<factor>', 'full' (= no bottleneck layer).")
     p.add_argument('--modes', default='labels,feat,vl2lite')
     p.add_argument('--epochs', type=int, default=50)
     p.add_argument('--eval-every', type=int, default=0,
@@ -76,35 +111,35 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--num-workers', type=int, default=0)
     p.add_argument('--gpus', default='0')
     p.add_argument('--resume', action='store_true',
-                   help='Skip runs already in results_per_seed.csv with a saved .pt '
-                        '(use only with the same --out and settings)')
-    # VL2Lite
+                   help='Skip runs already in results_per_seed.csv with a saved .pt. '
+                        'Allowed only when training settings match (seeds/dims/modes may differ).')
+    # VL2Lite-style KD (lam_cls_start=0.5 deviates from the paper's 0.01; report as "VL2Lite-style")
     p.add_argument('--temperature', type=float, default=2.0)
     p.add_argument('--lam-cls-start', type=float, default=0.50)
     p.add_argument('--lam-cls-end', type=float, default=0.80)
-    p.add_argument('--kd-logit-scale', type=float, default=10.0,
-                   help='Controlled image-text similarity scale for stable distillation (not official VL2Lite)')
+    p.add_argument('--kd-logit-scale', type=float, default=None,
+                   help="R1: image-text logit scale for the linguistic loss. Default: CLIP's "
+                        'learned scale (~100). Small values flatten the teacher targets.')
     # feat mode
     p.add_argument('--w-mse', type=float, default=1.0)
     p.add_argument('--w-cos', type=float, default=2.0)
     p.add_argument('--w-consistency', type=float, default=0.0,
-                   help='Optional consistency penalty; disabled by default. Digit flips can change class identity; optional small shifts only.')
+                   help='Optional small-shift consistency for KD modes (digit flips change identity).')
     # Analysis / benchmark
     p.add_argument('--accuracy-tolerance', type=float, default=1.0)
     p.add_argument('--knee-gain', type=float, default=2.0,
-                   help='SV-6: knee = smallest d after which every doubling gains < this many pp')
+                   help='knee = smallest d after which every doubling gains < this many pp')
     p.add_argument('--benchmark', choices=['after', 'inline', 'none'], default='after')
-    p.add_argument('--benchmark-repeats', type=int, default=150)
+    p.add_argument('--benchmark-repeats', type=int, default=2000,
+                   help='Inferences per trial; ~2000 gives a multi-second window the NVML '
+                        'energy counter can resolve')
     p.add_argument('--benchmark-trials', type=int, default=5)
     return p
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 class SVHNView(Dataset):
-    """One view per dataset (student OR teacher). Returns (image, label, local_index).
-
-    The local index addresses the cached teacher features for the training split.
-    """
+    """One view per dataset (student OR teacher). Returns (image, label, local_index)."""
     def __init__(self, base, indices, tf):
         self.base, self.indices, self.tf = base, np.asarray(indices, dtype=np.int64), tf
 
@@ -152,7 +187,6 @@ class _ConcatLabelled(Dataset):
 
 
 def load_svhn(root, download, use_extra=False):
-    """SV-1 / SV-2: SVHN train (+ optional extra) and test splits."""
     tr = datasets.SVHN(root=root, split='train', download=download)
     te = datasets.SVHN(root=root, split='test', download=download)
     if use_extra:
@@ -196,7 +230,6 @@ def mle_dimension(embeddings, ks, n: int, seed: int) -> pd.DataFrame:
 
 
 def mle_stability(embeddings, ks, n, seed, repeats):
-    """SV-7: median-over-k MLE on several random subsamples (80% of data at most)."""
     n_sub = min(n, int(0.8 * len(embeddings)))
     vals = [float(mle_dimension(embeddings, ks, n_sub, seed + 1000 + r)['mle_id'].median())
             for r in range(repeats)]
@@ -232,7 +265,7 @@ def build_teacher_cache(teacher, dataset, device, batch_size, workers, cache_pat
 
 @torch.no_grad()
 def encode_class_prompts(teacher, tokenizer, device):
-    """SV-2: prompt ensemble, averaged and renormalised per class -> (C, D)."""
+    """Prompt ensemble, averaged and renormalised per class -> (C, D)."""
     protos = []
     for name in PROMPT_NAMES:
         toks = tokenizer([t.format(name) for t in PROMPT_TEMPLATES]).to(device)
@@ -242,14 +275,13 @@ def encode_class_prompts(teacher, tokenizer, device):
 
 
 def zero_shot_accuracy(feats, text, labels):
-    """FM-3: CLIP zero-shot accuracy from cached features (diagnostic only)."""
     pred = (F.normalize(feats.float(), dim=-1) @ F.normalize(text.float(), dim=-1).T).argmax(1)
     return 100.0 * float((pred.numpy() == np.asarray(labels)).mean())
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
 class StudentMLE(nn.Module):
-    """backbone -> Linear(backbone_dim, d_b) -> Linear(d_b, C)."""
+    """backbone -> [Linear(backbone_dim, d_b) unless d_b == backbone_dim] -> Linear(d_b, C)."""
     def __init__(self, name, n_classes, d_b, pretrained=True):
         super().__init__()
         if name == 'resnet18':
@@ -260,8 +292,9 @@ class StudentMLE(nn.Module):
                 weights=models.MobileNet_V2_Weights.DEFAULT if pretrained else None)
             net.classifier = nn.Identity()
         self.backbone = net
-        self.bottleneck = (nn.Identity() if d_b == BACKBONE_DIM[name]
-                           else nn.Linear(BACKBONE_DIM[name], d_b))
+        self.has_bottleneck_layer = d_b != BACKBONE_DIM[name]          # R4
+        self.bottleneck = (nn.Linear(BACKBONE_DIM[name], d_b) if self.has_bottleneck_layer
+                           else nn.Identity())
         self.classifier = nn.Linear(d_b, n_classes)
 
     def forward(self, x, return_bottleneck=False):
@@ -308,7 +341,7 @@ def relational_kd(z, t_img):
 
 
 def linguistic_kd(z, t_img, t_txt, cond_text, logit_scale, temp):
-    """CLIP-scaled image-text logits; F.kl_div(log q, p) = KL(p_teacher || q_student)."""
+    """Image-text logits; F.kl_div(log q, p) = KL(p_teacher || q_student)."""
     protos = F.normalize(cond_text(t_txt.float()), dim=-1)
     s_lw = logit_scale * F.normalize(z.float(), dim=-1) @ protos.T
     s_vlm = logit_scale * (F.normalize(t_img.float(), dim=-1)
@@ -324,7 +357,7 @@ def feature_kd(z, t_img, align):
 
 
 def shift_consistency(student, x, z, max_shift=8):
-    """SV-4: label-preserving small translation (flips change digit identity)."""
+    """Label-preserving small translation (flips change digit identity)."""
     dy, dx = (int(v) for v in torch.randint(-max_shift, max_shift + 1, (2,)))
     z_aug, _ = student(torch.roll(x, shifts=(dy, dx), dims=(-2, -1)), return_bottleneck=True)
     return (F.normalize(z.float(), dim=-1)
@@ -400,11 +433,11 @@ def bench_trial_rows(tag, bench):
 
 
 def benchmark_saved(results, out, device, a):
-    """SV-8: time every saved deployable model sequentially on one idle GPU."""
+    """Time every saved deployable model sequentially on one idle GPU."""
     rows = []
     for r in results:
         obj = torch.load(out / f"{r['tag']}.pt", map_location='cpu', weights_only=True)
-        dep = Deployable(StudentMLE(a.student, NUM_CLASSES, r['bottleneck_d'], pretrained=False))
+        dep = Deployable(StudentMLE(a.student, NUM_CLASSES, int(r['bottleneck_d']), pretrained=False))
         dep.load_state_dict(obj['student_deployed'])
         b = benchmark(dep.to(device), device, a)
         r.update({k: b[k] for k in BENCH_KEYS})
@@ -444,10 +477,7 @@ def pareto_freq_per_seed(frame):
 
 
 def knee_analysis(sub, knee_gain):
-    """SV-6: accuracy gain per doubling of d, and the knee dimension.
-
-    knee = smallest evaluated d from which every further doubling gains < knee_gain pp.
-    """
+    """Accuracy gain per doubling of d; knee = smallest d after which every doubling gains < knee_gain."""
     s = sub.sort_values('bottleneck_d')
     d = s['bottleneck_d'].to_numpy(float)
     acc = s['test_accuracy_pct'].to_numpy(float)
@@ -485,6 +515,22 @@ def parse_dims(spec, mle_d, full_d):
     return sorted(dims)
 
 
+def check_resume_signature(out, a, run_signature):
+    """R2: refuse to mix runs trained under different settings."""
+    sigfile, results_csv = out / 'run_signature.txt', out / 'results_per_seed.csv'
+    if results_csv.exists() and not a.resume:
+        raise RuntimeError('Existing results in --out. Use --resume (same training settings) '
+                           'or a fresh --out directory.')
+    if results_csv.exists() and not sigfile.exists():
+        raise RuntimeError('Results in --out were produced by an older script version (no '
+                           'run_signature.txt). They used different settings and must not be '
+                           'mixed with this run. Use a fresh --out directory.')
+    if sigfile.exists() and sigfile.read_text().strip() != run_signature:
+        raise RuntimeError('Training settings differ from the existing run in --out. '
+                           'Use a fresh --out directory.')
+    sigfile.write_text(run_signature)
+
+
 # ── Training ──────────────────────────────────────────────────────────────────
 def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
               vlm_dim, device, a):
@@ -506,8 +552,7 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
     train_loader = DataLoader(ds_train, batch_size=a.batch_size, shuffle=True,
                               num_workers=a.num_workers, pin_memory=device.type == 'cuda',
                               persistent_workers=a.num_workers > 0)
-    # Test loader uses at most 2 short-lived workers. A second persistent worker pool
-    # next to the training pool exhausted Windows memory -> OSError [Errno 22].
+    # At most 2 short-lived test workers (a second persistent pool caused OSError 22 on Windows)
     test_loader = DataLoader(ds_test, batch_size=a.batch_size, shuffle=False,
                              num_workers=min(a.num_workers, 2), persistent_workers=False)
     t_txt = teacher_txt.to(device)
@@ -534,7 +579,7 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
                 k1, k2 = mse.item(), cos.item()
             else:
                 l_vis = relational_kd(z, t_img)
-                l_txt = linguistic_kd(z, t_img, t_txt, cond_text, a.kd_logit_scale, a.temperature)
+                l_txt = linguistic_kd(z, t_img, t_txt, cond_text, a.kd_logit_scale_used, a.temperature)
                 loss = lam_cls * l_cls + lam_kd * l_vis + lam_kd * l_txt
                 k1, k2 = l_vis.item(), l_txt.item()
 
@@ -551,14 +596,14 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
 
         sched.step()
         n = len(ds_train)
-        last = epoch == a.epochs - 1
-        if last or (a.eval_every > 0 and (epoch + 1) % a.eval_every == 0):
+        evaluated = epoch == a.epochs - 1 or (a.eval_every > 0 and (epoch + 1) % a.eval_every == 0)
+        if evaluated:
             test = evaluate(student, test_loader, device)
-        acc_txt = f"{test['accuracy_pct']:.2f}" if (last or (a.eval_every > 0 and (epoch + 1) % a.eval_every == 0)) else 'n/a'
         curves.append({'tag': tag, 'mode': mode, 'bottleneck_d': d_b, 'seed': seed,
                        'epoch': epoch + 1, 'lam_cls': lam_cls if mode == 'vl2lite' else 1.0,
                        **{k: v / n for k, v in sums.items()},
-                        'test_accuracy_pct': test['accuracy_pct'] if (last or (a.eval_every > 0 and (epoch + 1) % a.eval_every == 0)) else float('nan')})
+                       'test_accuracy_pct': test['accuracy_pct'] if evaluated else float('nan')})
+        acc_txt = f"{test['accuracy_pct']:.2f}" if evaluated else 'n/a'
         print(f"[{tag}] ep{epoch + 1:02d}/{a.epochs} loss={sums['loss']/n:.4f} "
               f"cls={sums['cls']/n:.4f} kd1={sums['kd1']/n:.4f} kd2={sums['kd2']/n:.4f} "
               f"test_acc={acc_txt}", flush=True)
@@ -571,14 +616,16 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
                 'bottleneck_d': d_b, 'mode': mode, 'seed': seed}, out_dir / f'{tag}.pt')
     pd.DataFrame(curves).to_csv(out_dir / f'{tag}_history.csv', index=False)
     res = {'tag': tag, 'mode': mode, 'seed': seed, 'bottleneck_d': d_b,
+           'has_bottleneck_layer': student.has_bottleneck_layer,                # R4
            'test_accuracy_pct': test['accuracy_pct'], 'test_macro_f1_pct': test['macro_f1_pct'],
-           'parameters': sum(p.numel() for p in deployed.parameters()), 'train_seconds': train_s}
+           'parameters': sum(p.numel() for p in deployed.parameters()), 'train_seconds': train_s,
+           'run_signature': a.run_signature}
     res.update({k: (bench[k] if bench else float('nan')) for k in BENCH_KEYS})
     return res, bench, curves
 
 
 def _worker(gpu_id, configs, shared, q):
-    """SV-4: no CLIP model in workers; only student-view datasets are needed."""
+    """No CLIP model in workers; only student-view datasets are needed."""
     device = torch.device(f'cuda:{gpu_id}')
     torch.cuda.set_device(device)
     a = shared['a']
@@ -606,8 +653,13 @@ def run():
         raise ValueError('epochs and benchmark trials/repeats must be positive')
     gpu_ids = [int(g) for g in a.gpus.split(',')]
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-    seed_everything(seeds[0])
 
+    # R2: check resume safety before any expensive work
+    a.run_signature = hashlib.sha256(json.dumps(
+        {k: getattr(a, k) for k in SIGNATURE_FIELDS}, sort_keys=True).encode()).hexdigest()[:16]
+    check_resume_signature(out, a, a.run_signature)
+
+    seed_everything(a.data_seed)
     device = torch.device(f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu')
     if device.type == 'cuda':
         torch.cuda.set_device(device)
@@ -621,13 +673,13 @@ def run():
     tokenizer = open_clip.get_tokenizer(a.teacher)
     teacher.eval(); teacher.requires_grad_(False)
 
-    train_ix = balanced_indices(labels_of(train_base), a.max_train, seeds[0])
-    test_ix = balanced_indices(labels_of(test_base), a.max_test, seeds[0])
+    # R3: subsampling uses data_seed, not the training seeds
+    train_ix = balanced_indices(labels_of(train_base), a.max_train, a.data_seed)
+    test_ix = balanced_indices(labels_of(test_base), a.max_test, a.data_seed)
     ds_train = SVHNView(train_base, train_ix, student_transform())
     ds_test = SVHNView(test_base, test_ix, student_transform())
     print(f'Train/test: {len(ds_train)}/{len(ds_test)}')
 
-    # Teacher caches: train (used for KD) and test (zero-shot diagnostic only)
     def cache_for(ix, split):
         sig = hashlib.sha256(ix.tobytes() + f'{a.teacher}/{a.pretrained}/SVHN/extra={a.use_extra}/{split}'.encode()).hexdigest()[:16]
         return out / f'teacher_{split}_{a.teacher}_{a.pretrained}_{sig}.pt'.replace('/', '_')
@@ -636,23 +688,30 @@ def run():
     teacher_test = build_teacher_cache(teacher, SVHNView(test_base, test_ix, teacher_tf),
                                        device, a.batch_size, a.num_workers, cache_for(test_ix, 'test'))
     teacher_txt = encode_class_prompts(teacher, tokenizer, device)
-    a.logit_scale = float(teacher.logit_scale.exp().item())
+    clip_scale = float(teacher.logit_scale.exp().item())
+    # R1: default to CLIP's learned scale; an explicit value is an ablation
+    a.kd_logit_scale_used = clip_scale if a.kd_logit_scale is None else float(a.kd_logit_scale)
+    if a.kd_logit_scale is not None and a.kd_logit_scale < 0.5 * clip_scale:
+        print(f'WARNING: --kd-logit-scale {a.kd_logit_scale} is far below CLIP\'s {clip_scale:.1f}; '
+              'teacher targets will be close to uniform. Report this as an ablation.')
     vlm_dim = teacher_feats.shape[1]
 
-    y_train = np.asarray(labels_of(train_base))[train_ix]
-    y_test = np.asarray(labels_of(test_base))[test_ix]
+    y_train = labels_of(train_base)[train_ix]
+    y_test = labels_of(test_base)[test_ix]
     zs = {'train_zero_shot_pct': zero_shot_accuracy(teacher_feats, teacher_txt, y_train),
           'test_zero_shot_pct': zero_shot_accuracy(teacher_test, teacher_txt, y_test),
+          'clip_logit_scale': clip_scale, 'kd_logit_scale_used': a.kd_logit_scale_used,
           'templates': PROMPT_TEMPLATES, 'class_prompt_names': PROMPT_NAMES}
     (out / 'teacher_zero_shot.json').write_text(json.dumps(zs, indent=2))
-    print(f"Teacher feats {tuple(teacher_feats.shape)}, logit scale {a.logit_scale:.1f}, "
-          f"CLIP zero-shot test acc {zs['test_zero_shot_pct']:.2f}%")
+    print(f"Teacher feats {tuple(teacher_feats.shape)}, CLIP logit scale {clip_scale:.1f}, "
+          f"KD scale used {a.kd_logit_scale_used:.1f}, zero-shot test acc {zs['test_zero_shot_pct']:.2f}%")
 
-    id_table = mle_dimension(teacher_feats, a.id_ks, a.id_samples, seeds[0])
+    # R3: MLE uses data_seed so mle_d (and the d grid) never depends on the seed list
+    id_table = mle_dimension(teacher_feats, a.id_ks, a.id_samples, a.data_seed)
     id_table.to_csv(out / 'levina_bickel_mle.csv', index=False)
     mle_float = float(id_table['mle_id'].median())
     mle_d = max(2, min(vlm_dim, math.ceil(mle_float)))
-    stab = mle_stability(teacher_feats, a.id_ks, a.id_samples, seeds[0], a.id_repeats)
+    stab = mle_stability(teacher_feats, a.id_ks, a.id_samples, a.data_seed, a.id_repeats)
     print(id_table.to_string(index=False))
     print(f"MLE dimension: {mle_d} (stability {stab['mean']:.2f} +/- {stab['std']:.2f})")
     (out / 'mle_summary.json').write_text(json.dumps(
@@ -665,22 +724,6 @@ def run():
     dims = parse_dims(a.dims, mle_d, BACKBONE_DIM[a.student])
     configs = [(m, d, s) for s in seeds for d in dims for m in modes]
     print(f'Dims {dims} | modes {modes} | seeds {seeds} | {len(configs)} runs on GPUs {gpu_ids}')
-
-    # Resume is only safe when model/dataset/training settings match.
-    signature_fields = ['teacher', 'pretrained', 'student', 'no_pretrained_student',
-                        'use_extra', 'max_train', 'max_test', 'epochs', 'batch_size', 'lr',
-                        'temperature', 'lam_cls_start', 'lam_cls_end',
-                        'kd_logit_scale', 'w_mse', 'w_cos', 'w_consistency',
-                        'dims', 'modes', 'seeds', 'id_samples', 'id_ks']
-    run_signature = hashlib.sha256(json.dumps(
-        {k: getattr(a, k) for k in signature_fields}, sort_keys=True).encode()).hexdigest()
-    sigfile = out / 'run_signature.txt'
-    if a.resume and (out / 'results_per_seed.csv').exists():
-        if not sigfile.exists() or sigfile.read_text().strip() != run_signature:
-            raise RuntimeError('Unsafe --resume: settings changed or signature missing. Use a fresh --out directory.')
-    elif (out / 'results_per_seed.csv').exists():
-        raise RuntimeError('Existing results detected. Use a fresh --out directory or matching --resume.')
-    sigfile.write_text(run_signature)
 
     done_rows = []
     if a.resume and (out / 'results_per_seed.csv').exists():
@@ -706,7 +749,7 @@ def run():
         for m, d, s in configs:
             collect(*train_one(m, d, s, teacher_feats, teacher_txt, ds_train, ds_test,
                                vlm_dim, device, a))
-    else:
+    elif configs:
         shared = {'a': a, 'teacher_feats': teacher_feats, 'teacher_txt': teacher_txt,
                   'vlm_dim': vlm_dim, 'train_ids': train_ix, 'test_ids': test_ix}
         ctx = mp.get_context('spawn')
@@ -725,6 +768,9 @@ def run():
         for p in procs:
             p.join()
 
+    # Keep only runs belonging to the requested grid (seeds/dims/modes of this call)
+    wanted = {f'{m}_d{d}_seed{s}' for s in seeds for d in dims for m in modes}
+    results = [r for r in results if r['tag'] in wanted]
     if not results:
         raise RuntimeError('No configuration finished; see [ERROR] messages above.')
     if a.benchmark == 'after':
@@ -738,16 +784,14 @@ def run():
     frame = pd.DataFrame(results)
     expected = len(seeds)
     summary = frame.groupby(['mode', 'bottleneck_d']).agg(
+        has_bottleneck_layer=('has_bottleneck_layer', 'first'),
         test_accuracy_pct=('test_accuracy_pct', 'mean'),
-        test_accuracy_std=('test_accuracy_pct', 'std'),
+        test_accuracy_std=('test_accuracy_pct', 'std'),          # NaN for a single seed
         test_macro_f1_pct=('test_macro_f1_pct', 'mean'),
         latency_ms=('latency_ms', 'mean'), latency_iqr_ms=('latency_iqr_ms', 'mean'),
         energy_mJ=('energy_mJ', 'mean'), energy_iqr_mJ=('energy_iqr_mJ', 'mean'),
         parameters=('parameters', 'first'), train_seconds=('train_seconds', 'mean'),
         n_seeds=('seed', 'count')).reset_index()
-    # A single seed has undefined SD; never display it as zero variance.
-    # Leave NaN for n_seeds == 1.
-
     summary['mle_selected'] = summary['bottleneck_d'].eq(mle_d)
     if (summary['n_seeds'] < expected).any():
         print(f'WARNING: some configurations have fewer than {expected} seeds; check [ERROR] lines.')
@@ -785,10 +829,11 @@ def run():
     (out / 'selection.json').write_text(json.dumps(
         {'dataset': 'SVHN', 'use_extra': a.use_extra, 'num_classes_minus_1': NUM_CLASSES - 1,
          'mle_d': mle_d, 'mle_stability': stab, 'teacher_zero_shot': zs,
+         'run_signature': a.run_signature,
          'accuracy_tolerance_pp': a.accuracy_tolerance, 'modes': selection,
          'note': 'd_eps and knee_d are computed on the test set (no validation split); '
                  'report them as post-hoc analysis, not model selection. Pareto claims '
-                 'cover only the evaluated grid.'}, indent=2))
+                 'cover only the evaluated grid. The largest d has no bottleneck layer.'}, indent=2))
     (out / 'config.json').write_text(json.dumps(
         {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}, indent=2))
     print(summary.to_string(index=False))
