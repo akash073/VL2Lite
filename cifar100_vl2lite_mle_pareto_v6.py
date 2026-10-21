@@ -1,13 +1,3 @@
-"""VL2Lite-style KD + Levina-Bickel MLE bottleneck — CIFAR-100 edition (v5).
-
-Requires: pip install torch torchvision open_clip_torch scikit-learn pandas numpy pynvml
-
-Smoke:  python cifar100_vl2lite_mle_pareto_v5.py --max-train 2000 --max-test 500 --epochs 2 \
-            --seeds 42 --dims mle,full --benchmark-repeats 30 --id-samples 1000 --gpus 0
-Full:   python cifar100_vl2lite_mle_pareto_v5.py --epochs 50 --seeds 42,43,44 --gpus 0,1 --num-workers 2
-Add seeds later:  same command with --seeds 42,43,44 --resume
-"""
-
 import argparse
 import hashlib
 import json
