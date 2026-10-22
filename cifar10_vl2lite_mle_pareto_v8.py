@@ -1,11 +1,71 @@
-"""VL2Lite-style KD + Levina-Bickel MLE bottleneck — Tiny ImageNet edition (v6 accuracy-focused).
+"""VL2Lite-style KD + Levina-Bickel MLE bottleneck — CIFAR-10 edition (v7).
 
-Smoke:  python tinyimagenet_vl2lite_mle_pareto_v5.py --max-train 2000 --max-test 500 --epochs 2 \
+RQ1: Does the Levina-Bickel MLE estimate of CLIP vision-embedding intrinsic
+dimensionality predict where the student bottleneck stops limiting accuracy,
+in particular for geometry-preserving distillation?
+
+v5 corrections to v4 (see R-tags in code)
+  R1  --kd-logit-scale defaulted to a fixed 10. With T=2 that makes CLIP's teacher
+      distribution nearly uniform (0.155 on the top class in a clear case, 0.114
+      for a weak teacher), so the linguistic loss again carried almost no class
+      signal -- the v3 FIX-2 problem returned. Default is now CLIP's own learned
+      logit scale; an explicit value can still be passed for an ablation, and the
+      scale actually used is saved.
+  R2  The resume signature included seeds/dims/modes, so adding seeds 43,44 to a
+      finished seed-42 run was refused. Only per-run TRAINING settings are in the
+      signature now; each run's tag already encodes mode, d and seed.
+  R3  Data subsampling and the MLE estimate used seeds[0]. Resuming with a
+      different seed list could change mle_d and therefore the whole d grid.
+      They now use a fixed --data-seed, independent of training seeds.
+  R4  d = full uses no bottleneck layer (identity), as in v4, but this is now
+      recorded per row (has_bottleneck_layer) so the architecture change at
+      d = full is visible in every results table.
+  R5  Docstring commands referred to other file names.
+  R6  New layers (bottleneck, classifier, KD heads) get lr x --head-lr-mult (default 10);
+      at the backbone lr they stayed undertrained, penalising small d most.
+  R7  Each run reports its final training cross-entropy and last-epoch drop;
+      the summary flags configurations that had not converged.
+v7 (merged): the accuracy-focused training recipe from the user's v6 plus the
+Windows-stability fixes. Identical training code across all five datasets.
+  Recipe
+  A1  AdamW by default (--optimizer adamw|sgd): backbone lr 1e-4, new layers
+      lr x --head-lr-mult (10); --weight-decay (default 1e-4).
+  A2  Label smoothing on the classification loss (--label-smoothing, default 0.1).
+      It is known to tighten class clusters in feature space; run one ablation
+      with --label-smoothing 0 to show the plateau location does not depend on it.
+  A3  Student-only train augmentation: RandomResizedCrop(224, scale 0.72-1.0)
+      plus horizontal flip where flips preserve the class (off for SVHN digits).
+      Teacher features stay cached from un-augmented images. --no-augment ablates.
+  A4  Every d, including the largest, has a bottleneck Linear layer, so widths
+      differ only in width. --full-identity restores the old identity at full d.
+  Stability (Windows)
+  W1  CUDA_DEVICE_ORDER=PCI_BUS_ID: --gpus indices match nvidia-smi, and NVML
+      energy readings come from the GPU doing the computation.
+  W2  Startup GPU report with a warning if the selected GPU drives a display.
+  W3  Resumable teacher extraction: small batches (--extract-batch-size 32),
+      per-batch GPU sync, progress output, partial cache every
+      --extract-save-every batches.
+  W4  faulthandler prints a stack trace on hard crashes.
+
+
+Comparability warning: v4/v5 settings (lam_cls_start=0.5, final-epoch-only test,
+identity at full d, 50 epochs) differ from the v3 runs behind the earlier CIFAR-10,
+FMNIST and SVHN tables. Re-run all three datasets with identical v5 settings before
+comparing them in a paper.
+
+Requires: pip install torch torchvision open_clip_torch scikit-learn pandas numpy pynvml
+
+Smoke:  python cifar10_vl2lite_mle_pareto_v7.py --max-train 2000 --max-test 500 --epochs 2 \
             --seeds 42 --dims mle,full --benchmark-repeats 30 --id-samples 1000 --gpus 0
-Full:   python tinyimagenet_vl2lite_mle_pareto_v5.py --epochs 50 --seeds 42,43,44 --gpus 0,1 --num-workers 2
+Full:   python cifar10_vl2lite_mle_pareto_v7.py --epochs 50 --seeds 42,43,44 --gpus 0,1 --num-workers 2
 Add seeds later:  same command with --seeds 42,43,44 --resume
 """
 
+import os
+# W1: number GPUs like nvidia-smi (PCI bus order). Must be set before CUDA starts.
+os.environ.setdefault('CUDA_DEVICE_ORDER', 'PCI_BUS_ID')
+import faulthandler
+faulthandler.enable()          # W4: print a stack trace on hard crashes
 import argparse
 import hashlib
 import json
@@ -13,7 +73,6 @@ import math
 import multiprocessing as mp
 import random
 import time
-import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -23,14 +82,53 @@ import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.neighbors import NearestNeighbors
-from torch.utils.data import DataLoader, Dataset
-from PIL import Image
-from torchvision import models, transforms
+from torch.utils.data import DataLoader, Dataset, Subset
+from torchvision import datasets, models, transforms
 
+CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
+# Grammatical names for prompts, index-aligned with CIFAR10_CLASSES
+PROMPT_NAMES = ['an airplane', 'an automobile', 'a bird', 'a cat', 'a deer',
+                'a dog', 'a frog', 'a horse', 'a ship', 'a truck']
+# CLIP-style ensemble; CIFAR images are small and often blurry after upscaling
 PROMPT_TEMPLATES = ['a photo of {}.', 'a blurry photo of {}.',
                     'a low resolution photo of {}.', 'a close-up photo of {}.']
-NUM_CLASSES = 200
-BACKBONE_DIM = {'resnet18': 512, 'mobilenet_v2': 1280}
+NUM_CLASSES = 10
+# A3: train-time horizontal flip (horizontal flips preserve the class)
+AUG_HFLIP = True
+# Student backbones: pooled feature width (the 'full' bottleneck d) for each architecture
+BACKBONE_DIM = {'resnet18': 512, 'resnet50': 2048, 'mobilenet_v2': 1280,
+                'mobilenet_v3_large': 960, 'efficientnet_b0': 1280, 'convnext_tiny': 768}
+
+
+def build_backbone(name, pretrained=True):
+    """ImageNet-pretrained (or random) feature extractor with its classification layer
+    removed, returning pooled features of width BACKBONE_DIM[name]."""
+    W = models
+    if name == 'resnet18':
+        net = W.resnet18(weights=W.ResNet18_Weights.DEFAULT if pretrained else None)
+        width = net.fc.in_features; net.fc = nn.Identity()
+    elif name == 'resnet50':
+        net = W.resnet50(weights=W.ResNet50_Weights.DEFAULT if pretrained else None)
+        width = net.fc.in_features; net.fc = nn.Identity()
+    elif name == 'mobilenet_v2':
+        net = W.mobilenet_v2(weights=W.MobileNet_V2_Weights.DEFAULT if pretrained else None)
+        width = net.classifier[1].in_features; net.classifier = nn.Identity()
+    elif name == 'mobilenet_v3_large':
+        net = W.mobilenet_v3_large(weights=W.MobileNet_V3_Large_Weights.DEFAULT if pretrained else None)
+        width = net.classifier[0].in_features; net.classifier = nn.Identity()
+    elif name == 'efficientnet_b0':
+        net = W.efficientnet_b0(weights=W.EfficientNet_B0_Weights.DEFAULT if pretrained else None)
+        width = net.classifier[1].in_features; net.classifier = nn.Identity()
+    elif name == 'convnext_tiny':
+        # Keep LayerNorm2d + Flatten (classifier[0:2]); replace only the final Linear.
+        net = W.convnext_tiny(weights=W.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None)
+        width = net.classifier[2].in_features; net.classifier[2] = nn.Identity()
+    else:
+        raise ValueError(f'Unknown student backbone: {name}')
+    if width != BACKBONE_DIM[name]:
+        raise RuntimeError(f'{name}: feature width {width} != expected {BACKBONE_DIM[name]}')
+    return net
 
 # R2: settings that change how an individual run is trained. Seeds, dims and modes
 # only choose WHICH runs exist (encoded in each tag), so they are not included.
@@ -38,8 +136,8 @@ SIGNATURE_FIELDS = ['teacher', 'pretrained', 'student', 'no_pretrained_student',
                     'max_train', 'max_test', 'data_seed', 'epochs',
                     'batch_size', 'lr', 'head_lr_mult', 'temperature', 'lam_cls_start', 'lam_cls_end',
                     'kd_logit_scale', 'w_mse', 'w_cos', 'w_consistency',
-                    'id_samples', 'id_ks', 'optimizer', 'weight_decay', 'label_smoothing',
-                    'no_augment', 'full_identity']
+                    'id_samples', 'id_ks', 'optimizer', 'weight_decay',
+                    'label_smoothing', 'no_augment', 'full_identity']
 
 
 def seed_everything(s: int) -> None:
@@ -51,9 +149,8 @@ def seed_everything(s: int) -> None:
 def make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--data-root', default='./data',
-                   help='Folder containing tiny-imagenet-200/ or the Kaggle zip')
-    p.add_argument('--out', default='tinyimagenet_vl2lite_mle_results')
+    p.add_argument('--data-root', default='./data')
+    p.add_argument('--out', default='cifar10_vl2lite_mle_results')
     p.add_argument('--max-train', type=int, default=0)
     p.add_argument('--max-test', type=int, default=0)
     p.add_argument('--data-seed', type=int, default=42,
@@ -66,26 +163,31 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--id-ks', type=int, nargs='+', default=[5, 10, 20, 50])
     p.add_argument('--id-repeats', type=int, default=5,
                    help='MLE repeats on different random subsamples')
-    p.add_argument('--dims', default='8,mle*0.75,mle,mle*1.5,48,96,128,192,256,full',
-                   help="Tokens: integer, 'mle', 'mle*<factor>', 'full' (= no bottleneck layer).")
+    p.add_argument('--dims', default='8,mle*0.5,mle*0.75,mle,mle*1.25,mle*1.5,32,128,full',
+                   help="Tokens: integer, 'mle', 'mle*<factor>', 'full' (= backbone dim).")
     p.add_argument('--modes', default='labels,feat,vl2lite')
     p.add_argument('--epochs', type=int, default=50)
     p.add_argument('--eval-every', type=int, default=0,
                    help='Test only at final epoch by default (0). Positive values are diagnostic only.')
     p.add_argument('--batch-size', type=int, default=64)
+    p.add_argument('--extract-batch-size', type=int, default=32,
+                   help='W3: batch size for CLIP feature extraction (smaller = shorter GPU bursts)')
+    p.add_argument('--extract-save-every', type=int, default=100,
+                   help='W3: save a partial feature cache every N extraction batches')
     p.add_argument('--lr', type=float, default=1e-4,
-                   help='Learning rate for pretrained backbone (default 1e-4 with AdamW)')
+                   help='A1: learning rate for the pretrained backbone (default 1e-4 with AdamW)')
+    p.add_argument('--optimizer', choices=['adamw', 'sgd'], default='adamw')
+    p.add_argument('--weight-decay', type=float, default=1e-4)
+    p.add_argument('--label-smoothing', type=float, default=0.1,
+                   help='A2: label smoothing for the classification loss (0 disables)')
+    p.add_argument('--no-augment', action='store_true',
+                   help='A3: disable student-only train augmentation (ablation)')
+    p.add_argument('--full-identity', action='store_true',
+                   help='A4: old behaviour, no bottleneck layer at d = backbone dim')
     p.add_argument('--head-lr-mult', type=float, default=10.0,
                    help='R6: new layers (bottleneck, classifier, KD heads) train at lr x this. '
                         'They start from random weights; at the backbone lr they stay '
                         'undertrained, which penalises small bottlenecks most.')
-    p.add_argument('--optimizer', choices=['adamw', 'sgd'], default='adamw')
-    p.add_argument('--weight-decay', type=float, default=1e-4)
-    p.add_argument('--label-smoothing', type=float, default=0.1)
-    p.add_argument('--no-augment', action='store_true',
-                   help='Turn off student-only train augmentation for ablations.')
-    p.add_argument('--full-identity', action='store_true',
-                   help='Original v5 behavior: d=backbone_dim uses identity; keep off for controlled comparisons.')
     p.add_argument('--seeds', default='42,43,44')
     p.add_argument('--num-workers', type=int, default=0)
     p.add_argument('--gpus', default='0')
@@ -118,7 +220,7 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-class TinyImageNetView(Dataset):
+class CIFAR10View(Dataset):
     """One view per dataset (student OR teacher). Returns (image, label, local_index)."""
     def __init__(self, base, indices, tf):
         self.base, self.indices, self.tf = base, np.asarray(indices, dtype=np.int64), tf
@@ -146,110 +248,24 @@ def balanced_indices(targets, maximum: int, seed: int) -> np.ndarray:
 
 
 def student_transform(train=False, augment=True):
-    # Only student training is augmented. Teacher images remain deterministic and
-    # cached by original sample index: KD guidance is an invariant target.
-    spatial = ([transforms.RandomResizedCrop(224, scale=(0.72, 1.0), ratio=(0.9, 1.1)),
-                transforms.RandomHorizontalFlip(p=0.5)]
-               if train and augment else [transforms.Resize((224, 224))])
+    """A3: only the student's training view is augmented. Teacher features are cached
+    from un-augmented images, so they act as a fixed target for every crop/flip."""
+    if train and augment:
+        spatial = [transforms.RandomResizedCrop(224, scale=(0.72, 1.0), ratio=(0.9, 1.1))]
+        if AUG_HFLIP:
+            spatial.append(transforms.RandomHorizontalFlip(p=0.5))
+    else:
+        spatial = [transforms.Resize((224, 224))]
     return transforms.Compose(spatial + [
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
 
 
-class TinyImageNetSplit(Dataset):
-    """File-path dataset: returns (PIL image, label). Picklable and small, so
-    Windows DataLoader workers receive only paths (TIN-1)."""
-    def __init__(self, samples, classes):
-        self.paths = [p for p, _ in samples]
-        self.targets = np.array([y for _, y in samples], dtype=np.int64)
-        self.classes = classes
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, i):
-        with Image.open(self.paths[i]) as im:
-            return im.convert('RGB'), int(self.targets[i])
-
-
-def _find_tin_root(root):
-    hits = sorted(Path(root).rglob('wnids.txt'))
-    return hits[0].parent if hits else None
-
-
-def _extract_zips(root):
-    """Extract archives under root until tiny-imagenet-200 appears.
-
-    Handles the Tiny ImageNet zip nested inside a Kaggle archive. Each archive is
-    processed at most once (an earlier version re-extracted the outer zip forever).
-    """
-    seen = set()
-    while _find_tin_root(root) is None:
-        new = [z for z in sorted(Path(root).rglob('*.zip')) if z.resolve() not in seen]
-        if not new:
-            return False
-        for zp in new:
-            seen.add(zp.resolve())
-            with zipfile.ZipFile(zp) as zf:
-                names = zf.namelist()
-                if any(n.endswith('wnids.txt') or n.lower().endswith('.zip') for n in names):
-                    print(f'Extracting {zp.name} ...', flush=True)
-                    zf.extractall(zp.parent)
-                    break            # rescan: the extraction may have produced new zips
-    return True
-
-
-def _class_names(tin, wnids):
-    """First synonym from words.txt, de-duplicated with the next synonym if needed."""
-    words = {}
-    for line in (tin / 'words.txt').read_text(encoding='utf-8').splitlines():
-        if '\t' in line:
-            wnid, names = line.split('\t', 1)
-            words[wnid] = [s.strip() for s in names.split(',') if s.strip()]
-    names, used = [], set()
-    for w in wnids:
-        syn = words.get(w) or [w]
-        name = next((s for s in syn if s.lower() not in used), f'{syn[0]} ({w})')
-        used.add(name.lower())
-        names.append(name)
-    return names
-
-
-# Vowel letters with a consonant sound take "a" ("a European ...", "a unicycle")
-_A_PREFIXES = ('eu', 'uni', 'use', 'usu', 'one', 'once', 'uk')
-
-
-def _prompt_name(name):
-    low = name.lower()
-    vowel_sound = low[0] in 'aeiou' and not low.startswith(_A_PREFIXES)
-    return ('an ' if vowel_sound else 'a ') + name
-
-
-def load_tinyimagenet(root, download):
-    """Returns (train, test) TinyImageNetSplit; test = the labelled val split."""
-    tin = _find_tin_root(root)
-    if tin is None and download:
-        _extract_zips(root)
-        tin = _find_tin_root(root)
-    if tin is None:
-        raise FileNotFoundError(
-            f'tiny-imagenet-200 not found under {Path(root).resolve()}. Put the Kaggle zip '
-            'or the extracted tiny-imagenet-200 folder there.')
-    wnids = sorted(w.strip() for w in (tin / 'wnids.txt').read_text().split() if w.strip())
-    assert len(wnids) == NUM_CLASSES, f'Expected {NUM_CLASSES} wnids, found {len(wnids)}'
-    idx = {w: i for i, w in enumerate(wnids)}
-    classes = _class_names(tin, wnids)
-
-    train = [(str(p), idx[w]) for w in wnids
-             for p in sorted((tin / 'train' / w / 'images').glob('*.JPEG'))]
-    val = []
-    for line in (tin / 'val' / 'val_annotations.txt').read_text().splitlines():
-        parts = line.split('\t')
-        if len(parts) >= 2 and parts[1] in idx:
-            val.append((str(tin / 'val' / 'images' / parts[0]), idx[parts[1]]))
-    if not train or not val:
-        raise RuntimeError(f'Empty split under {tin}: train={len(train)}, val={len(val)}')
-    return TinyImageNetSplit(train, classes), TinyImageNetSplit(val, classes)
+def load_cifar10(root, download):
+    tr = datasets.CIFAR10(root=root, train=True, download=download)
+    te = datasets.CIFAR10(root=root, train=False, download=download)
+    assert list(tr.classes) == CIFAR10_CLASSES, f'Unexpected class list: {tr.classes}'
+    return tr, te
 
 
 def labels_of(ds):
@@ -293,7 +309,9 @@ def mle_stability(embeddings, ks, n, seed, repeats):
 
 
 @torch.no_grad()
-def build_teacher_cache(teacher, dataset, device, batch_size, workers, cache_path):
+def build_teacher_cache(teacher, dataset, device, batch_size, workers, cache_path, save_every=100):
+    """W3: extract CLIP image features with progress, per-batch GPU sync and
+    resumable partial saves. Rows are in dataset order (no shuffling)."""
     if cache_path.exists():
         obj = torch.load(cache_path, map_location='cpu', weights_only=True)
         if isinstance(obj, dict) and obj.get('features') is not None \
@@ -301,28 +319,86 @@ def build_teacher_cache(teacher, dataset, device, batch_size, workers, cache_pat
             print(f'Loaded teacher cache: {cache_path.name}')
             return obj['features']
         print('Cache mismatch — rebuilding.')
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=workers, pin_memory=device.type == 'cuda')
-    chunks = []
+
+    n_total = len(dataset)
+    partial = cache_path.with_name(cache_path.stem + '.partial.pt')
+    done = None
+    if partial.exists():
+        obj = torch.load(partial, map_location='cpu', weights_only=True)
+        if isinstance(obj, dict) and obj.get('n_total') == n_total \
+                and obj.get('features') is not None and obj['features'].shape[0] < n_total:
+            done = obj['features']
+            print(f'Resuming teacher extraction at {done.shape[0]}/{n_total} images', flush=True)
+    start = 0 if done is None else done.shape[0]
+
+    loader = DataLoader(Subset(dataset, range(start, n_total)), batch_size=batch_size,
+                        shuffle=False, num_workers=workers, pin_memory=device.type == 'cuda')
+    chunks = [] if done is None else [done]
     teacher.eval()
-    for timgs, _, _ in loader:
-        timgs = timgs.to(device)
+    t0, n_batches = time.perf_counter(), len(loader)
+    print(f'Extracting teacher features for {n_total - start} images '
+          f'({n_batches} batches of {batch_size}) -> {cache_path.name}', flush=True)
+    for b, (timgs, _, _) in enumerate(loader, 1):
+        timgs = timgs.to(device, non_blocking=True)
         if device.type == 'cuda':
             with torch.autocast(device_type='cuda'):
                 f = teacher.encode_image(timgs)
+            torch.cuda.synchronize(device)      # keep each GPU submission short
         else:
             f = teacher.encode_image(timgs)
         chunks.append(f.float().cpu())
+        if b % save_every == 0 or b == n_batches:
+            chunks = [torch.cat(chunks)]
+            n_done = chunks[0].shape[0]
+            torch.save({'features': chunks[0], 'n_total': n_total}, partial)
+            rate = (n_done - start) / max(time.perf_counter() - t0, 1e-6)
+            eta = (n_total - n_done) / max(rate, 1e-6)
+            print(f'  {n_done}/{n_total} images ({rate:.0f} img/s, ~{eta / 60:.1f} min left)', flush=True)
     feats = torch.cat(chunks)
+    assert feats.shape[0] == n_total, (feats.shape, n_total)
     torch.save({'features': feats}, cache_path)
+    partial.unlink(missing_ok=True)
     return feats
 
 
+def report_gpus(selected):
+    """W2: list GPUs (PCI order = nvidia-smi order) and warn if a selected GPU drives a display."""
+    if not torch.cuda.is_available():
+        print('CUDA not available: running on CPU')
+        return
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+    except Exception:
+        pynvml = None
+    print(f"GPUs (CUDA_DEVICE_ORDER={os.environ.get('CUDA_DEVICE_ORDER')}):")
+    for i in range(torch.cuda.device_count()):
+        props = torch.cuda.get_device_properties(i)
+        display, nv_name = 'unknown', None
+        if pynvml is not None:
+            try:
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                display = 'YES' if pynvml.nvmlDeviceGetDisplayActive(h) else 'no'
+                nv_name = pynvml.nvmlDeviceGetName(h)
+                nv_name = nv_name.decode() if isinstance(nv_name, bytes) else nv_name
+            except Exception:
+                pass
+        mark = '   <- selected' if i in selected else ''
+        print(f'  cuda:{i}  {props.name}  {props.total_memory / 2**30:.0f} GB  '
+              f'drives display: {display}{mark}')
+        if nv_name and nv_name != props.name:
+            print(f'  WARNING: CUDA device {i} is {props.name} but NVML device {i} is {nv_name}; '
+                  'energy readings may come from a different GPU (check CUDA_VISIBLE_DEVICES).')
+        if i in selected and display == 'YES':
+            print(f'  WARNING: cuda:{i} drives a display. Long GPU work on it can trigger a Windows '
+                  'driver reset (TDR), killing this job. Prefer a GPU with no monitor attached.')
+
+
 @torch.no_grad()
-def encode_class_prompts(teacher, tokenizer, device, prompt_names):
+def encode_class_prompts(teacher, tokenizer, device):
     """Prompt ensemble, averaged and renormalised per class -> (C, D)."""
     protos = []
-    for name in prompt_names:
+    for name in PROMPT_NAMES:
         toks = tokenizer([t.format(name) for t in PROMPT_TEMPLATES]).to(device)
         e = F.normalize(teacher.encode_text(toks).float(), dim=-1).mean(0)
         protos.append(F.normalize(e, dim=-1))
@@ -339,14 +415,8 @@ class StudentMLE(nn.Module):
     """backbone -> [Linear(backbone_dim, d_b) unless d_b == backbone_dim] -> Linear(d_b, C)."""
     def __init__(self, name, n_classes, d_b, pretrained=True, full_identity=False):
         super().__init__()
-        if name == 'resnet18':
-            net = models.resnet18(weights=models.ResNet18_Weights.DEFAULT if pretrained else None)
-            net.fc = nn.Identity()
-        else:
-            net = models.mobilenet_v2(
-                weights=models.MobileNet_V2_Weights.DEFAULT if pretrained else None)
-            net.classifier = nn.Identity()
-        self.backbone = net
+        self.backbone = build_backbone(name, pretrained)
+        # A4: identity only at full width and only if --full-identity
         self.has_bottleneck_layer = d_b != BACKBONE_DIM[name] or not full_identity
         self.bottleneck = (nn.Linear(BACKBONE_DIM[name], d_b) if self.has_bottleneck_layer
                            else nn.Identity())
@@ -422,16 +492,13 @@ def flip_consistency(student, x, z):
 @torch.no_grad()
 def evaluate(model, loader, device):
     model.eval()
-    pred, true, top5_hits = [], [], 0
+    pred, true = [], []
     for xs, ys, _ in loader:
         out = model(xs.to(device))
         if isinstance(out, tuple):
             out = out[1]
         pred.extend(out.argmax(1).cpu().tolist()); true.extend(ys.tolist())
-        top5 = out.topk(5, dim=1).indices.cpu()
-        top5_hits += int((top5 == ys.view(-1, 1)).any(dim=1).sum())
     return {'accuracy_pct': 100 * accuracy_score(true, pred),
-            'top5_accuracy_pct': 100 * top5_hits / len(true),
             'macro_f1_pct': 100 * f1_score(true, pred, average='macro', zero_division=0)}
 
 
@@ -494,7 +561,8 @@ def benchmark_saved(results, out, device, a):
     rows = []
     for r in results:
         obj = torch.load(out / f"{r['tag']}.pt", map_location='cpu', weights_only=True)
-        dep = Deployable(StudentMLE(a.student, NUM_CLASSES, int(r['bottleneck_d']), pretrained=False, full_identity=a.full_identity))
+        dep = Deployable(StudentMLE(a.student, NUM_CLASSES, int(r['bottleneck_d']), pretrained=False,
+                                    full_identity=a.full_identity))
         dep.load_state_dict(obj['student_deployed'])
         b = benchmark(dep.to(device), device, a)
         r.update({k: b[k] for k in BENCH_KEYS})
@@ -595,7 +663,7 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
     tag = f'{mode}_d{d_b}_seed{seed}'
     student = StudentMLE(a.student, NUM_CLASSES, d_b,
                          pretrained=not a.no_pretrained_student,
-                          full_identity=a.full_identity).to(device)
+                         full_identity=a.full_identity).to(device)
     cond_text = Condense(vlm_dim, d_b).to(device)
     align = nn.Linear(d_b, vlm_dim).to(device)
 
@@ -610,7 +678,7 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
 
     groups = [{'params': backbone_params, 'lr': a.lr},
               {'params': head_params, 'lr': a.lr * a.head_lr_mult}]
-    if a.optimizer == 'adamw':
+    if a.optimizer == 'adamw':                                            # A1
         opt = torch.optim.AdamW(groups, weight_decay=a.weight_decay)
     else:
         opt = torch.optim.SGD(groups, momentum=0.9, weight_decay=a.weight_decay)
@@ -637,7 +705,7 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
             xs, ys = xs.to(device), ys.to(device)
             t_img = teacher_feats[ix].to(device)
             z, logits = student(xs, return_bottleneck=True)
-            l_cls = F.cross_entropy(logits, ys, label_smoothing=a.label_smoothing)
+            l_cls = F.cross_entropy(logits, ys, label_smoothing=a.label_smoothing)   # A2
 
             if mode == 'labels':
                 loss, k1, k2 = l_cls, 0.0, 0.0
@@ -690,8 +758,7 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
     res = {'tag': tag, 'mode': mode, 'seed': seed, 'bottleneck_d': d_b,
            'final_train_ce': ce_last, 'last_epoch_ce_drop_pct': ce_drop,
            'has_bottleneck_layer': student.has_bottleneck_layer,                # R4
-           'test_accuracy_pct': test['accuracy_pct'], 'test_top5_accuracy_pct': test['top5_accuracy_pct'],
-           'test_macro_f1_pct': test['macro_f1_pct'],
+           'test_accuracy_pct': test['accuracy_pct'], 'test_macro_f1_pct': test['macro_f1_pct'],
            'parameters': sum(p.numel() for p in deployed.parameters()), 'train_seconds': train_s,
            'run_signature': a.run_signature}
     res.update({k: (bench[k] if bench else float('nan')) for k in BENCH_KEYS})
@@ -703,9 +770,9 @@ def _worker(gpu_id, configs, shared, q):
     device = torch.device(f'cuda:{gpu_id}')
     torch.cuda.set_device(device)
     a = shared['a']
-    train_base, test_base = load_tinyimagenet(a.data_root, download=False)
-    ds_train = TinyImageNetView(train_base, shared['train_ids'], student_transform(train=True, augment=not a.no_augment))
-    ds_test = TinyImageNetView(test_base, shared['test_ids'], student_transform())
+    train_base, test_base = load_cifar10(a.data_root, download=False)
+    ds_train = CIFAR10View(train_base, shared['train_ids'], student_transform(train=True, augment=not a.no_augment))
+    ds_test = CIFAR10View(test_base, shared['test_ids'], student_transform())
     for mode, d, seed in configs:
         try:
             q.put(('ok',) + train_one(mode, d, seed, shared['teacher_feats'], shared['teacher_txt'],
@@ -724,7 +791,7 @@ def run():
     if invalid_modes:
         raise ValueError(f'Unknown modes: {sorted(invalid_modes)}')
     if not 0.0 <= a.label_smoothing < 1.0:
-        raise ValueError('--label-smoothing must be between 0 and 1 (exclusive upper bound)')
+        raise ValueError('--label-smoothing must be in [0, 1)')
     if a.epochs < 1 or a.benchmark_trials < 1 or a.benchmark_repeats < 1:
         raise ValueError('epochs and benchmark trials/repeats must be positive')
     gpu_ids = [int(g) for g in a.gpus.split(',')]
@@ -739,11 +806,10 @@ def run():
     device = torch.device(f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu')
     if device.type == 'cuda':
         torch.cuda.set_device(device)
+    report_gpus(gpu_ids)                                                  # W2
 
-    train_base, test_base = load_tinyimagenet(a.data_root, download=True)
-    prompt_names = [_prompt_name(c) for c in train_base.classes]
-    print(f'Tiny ImageNet: train={len(train_base)}, test(val)={len(test_base)}, '
-          f'classes={len(train_base.classes)}; e.g. {prompt_names[:3]}')
+    train_base, test_base = load_cifar10(a.data_root, download=True)
+    print(f'CIFAR-10: train={len(train_base)}, test={len(test_base)}')
 
     import open_clip
     teacher, _, teacher_tf = open_clip.create_model_and_transforms(
@@ -754,18 +820,20 @@ def run():
     # R3: subsampling uses data_seed, not the training seeds
     train_ix = balanced_indices(labels_of(train_base), a.max_train, a.data_seed)
     test_ix = balanced_indices(labels_of(test_base), a.max_test, a.data_seed)
-    ds_train = TinyImageNetView(train_base, train_ix, student_transform(train=True, augment=not a.no_augment))
-    ds_test = TinyImageNetView(test_base, test_ix, student_transform())
+    ds_train = CIFAR10View(train_base, train_ix, student_transform(train=True, augment=not a.no_augment))
+    ds_test = CIFAR10View(test_base, test_ix, student_transform())
     print(f'Train/test: {len(ds_train)}/{len(ds_test)}')
 
     def cache_for(ix, split):
-        sig = hashlib.sha256(ix.tobytes() + f'{a.teacher}/{a.pretrained}/TinyImageNet/{split}'.encode()).hexdigest()[:16]
+        sig = hashlib.sha256(ix.tobytes() + f'{a.teacher}/{a.pretrained}/CIFAR10/{split}'.encode()).hexdigest()[:16]
         return out / f'teacher_{split}_{a.teacher}_{a.pretrained}_{sig}.pt'.replace('/', '_')
-    teacher_feats = build_teacher_cache(teacher, TinyImageNetView(train_base, train_ix, teacher_tf),
-                                        device, a.batch_size, a.num_workers, cache_for(train_ix, 'train'))
-    teacher_test = build_teacher_cache(teacher, TinyImageNetView(test_base, test_ix, teacher_tf),
-                                       device, a.batch_size, a.num_workers, cache_for(test_ix, 'test'))
-    teacher_txt = encode_class_prompts(teacher, tokenizer, device, prompt_names)
+    teacher_feats = build_teacher_cache(teacher, CIFAR10View(train_base, train_ix, teacher_tf),
+                                        device, a.extract_batch_size, a.num_workers,
+                                        cache_for(train_ix, 'train'), a.extract_save_every)
+    teacher_test = build_teacher_cache(teacher, CIFAR10View(test_base, test_ix, teacher_tf),
+                                       device, a.extract_batch_size, a.num_workers,
+                                        cache_for(test_ix, 'test'), a.extract_save_every)
+    teacher_txt = encode_class_prompts(teacher, tokenizer, device)
     clip_scale = float(teacher.logit_scale.exp().item())
     # R1: default to CLIP's learned scale; an explicit value is an ablation
     a.kd_logit_scale_used = clip_scale if a.kd_logit_scale is None else float(a.kd_logit_scale)
@@ -779,7 +847,7 @@ def run():
     zs = {'train_zero_shot_pct': zero_shot_accuracy(teacher_feats, teacher_txt, y_train),
           'test_zero_shot_pct': zero_shot_accuracy(teacher_test, teacher_txt, y_test),
           'clip_logit_scale': clip_scale, 'kd_logit_scale_used': a.kd_logit_scale_used,
-          'templates': PROMPT_TEMPLATES, 'class_prompt_names': prompt_names}
+          'templates': PROMPT_TEMPLATES, 'class_prompt_names': PROMPT_NAMES}
     (out / 'teacher_zero_shot.json').write_text(json.dumps(zs, indent=2))
     print(f"Teacher feats {tuple(teacher_feats.shape)}, CLIP logit scale {clip_scale:.1f}, "
           f"KD scale used {a.kd_logit_scale_used:.1f}, zero-shot test acc {zs['test_zero_shot_pct']:.2f}%")
@@ -865,7 +933,6 @@ def run():
         has_bottleneck_layer=('has_bottleneck_layer', 'first'),
         test_accuracy_pct=('test_accuracy_pct', 'mean'),
         test_accuracy_std=('test_accuracy_pct', 'std'),          # NaN for a single seed
-        test_top5_accuracy_pct=('test_top5_accuracy_pct', 'mean'),
         test_macro_f1_pct=('test_macro_f1_pct', 'mean'),
         latency_ms=('latency_ms', 'mean'), latency_iqr_ms=('latency_iqr_ms', 'mean'),
         energy_mJ=('energy_mJ', 'mean'), energy_iqr_mJ=('energy_iqr_mJ', 'mean'),
@@ -914,13 +981,14 @@ def run():
             'knee_d': knee, 'knee_gain_threshold_pp': a.knee_gain,
             'gain_per_doubling': gains}
     (out / 'selection.json').write_text(json.dumps(
-        {'dataset': 'TinyImageNet', 'test_split': 'official val (labelled; not an independent final test after dimension selection)', 'num_classes_minus_1': NUM_CLASSES - 1,
+        {'dataset': 'CIFAR10', 'num_classes_minus_1': NUM_CLASSES - 1,
          'mle_d': mle_d, 'mle_stability': stab, 'teacher_zero_shot': zs,
          'run_signature': a.run_signature,
          'accuracy_tolerance_pp': a.accuracy_tolerance, 'modes': selection,
          'note': 'd_eps and knee_d are computed on the test set (no validation split); '
                  'report them as post-hoc analysis, not model selection. Pareto claims '
-                 'cover only the evaluated grid. The largest d has no bottleneck layer.'}, indent=2))
+                 'cover only the evaluated grid. ' + ('The largest d has no bottleneck layer.'
+                 if a.full_identity else 'Every d, including the largest, has a bottleneck layer.')}, indent=2))
     (out / 'config.json').write_text(json.dumps(
         {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}, indent=2))
     print(summary.to_string(index=False))
