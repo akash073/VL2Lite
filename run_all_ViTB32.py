@@ -26,8 +26,8 @@ from pathlib import Path
 # name: (training script, extra flags for that dataset)
 DATASETS = {
     
-    'fmnist':                ('fmnist_vl2lite_mle_pareto_v8.py',       []),
-   # 'svhn':                  ('svhn_vl2lite_mle_pareto_v8.py',         []),
+   # 'fmnist':                ('fmnist_vl2lite_mle_pareto_v8.py',       []),
+    'svhn':                  ('svhn_vl2lite_mle_pareto_v8.py',         []),
     #'cifar10':               ('cifar10_vl2lite_mle_pareto_v8.py',      []),
     #'cifar100':              ('cifar100_vl2lite_mle_pareto_v8.py',     []),
     #'tinyimagenet':          ('tinyimagenet_vl2lite_mle_pareto_v8.py', []),
@@ -36,6 +36,11 @@ DATASETS = {
 # Student models to run on every dataset. Options: resnet18, resnet50, mobilenet_v2,
 # mobilenet_v3_large, efficientnet_b0, convnext_tiny
 STUDENTS = ['resnet18', 'mobilenet_v2', 'mobilenet_v3_large', 'efficientnet_b0', 'convnext_tiny','resnet50']
+
+
+# Reverse
+#STUDENTS = ['resnet50', 'convnext_tiny', 'efficientnet_b0', 'mobilenet_v3_large', 'mobilenet_v2', 'resnet18']
+
 
 # Epochs: a default, plus optional per-dataset overrides
 EPOCHS_DEFAULT = 20

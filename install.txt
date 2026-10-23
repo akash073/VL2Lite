@@ -6,7 +6,15 @@ python -m venv .
 source bin/activate
 
 
-pip install pandas
-pip install scikit-learn
-pip install nvidia-ml-py
+pip install pandas scikit-learn nvidia-ml-py
+
+scp tinyimage200.zip siu856558563@10.100.192.118:/scratch2/siu856558563/data/tinyimage200.zip
+
+
+ssh siu856558563@10.100.192.118
+
+
+
+
+scp siu856536670@10.100.192.118:/scratch2/siu856536670/results/tinyimagenet_resnet18_e20/results_per_seed.csv C:\Users\SIU856536670\data
 
