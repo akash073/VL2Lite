@@ -1,2 +1,12 @@
+
+cd VL2Lite
+
+python -m venv .
+
+source bin/activate
+
+
+pip install pandas
+pip install scikit-learn
 pip install nvidia-ml-py
 
