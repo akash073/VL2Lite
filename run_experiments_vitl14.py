@@ -43,6 +43,9 @@ DATASETS = {
 # mobilenet_v3_large, efficientnet_b0, convnext_tiny
 STUDENTS = ['resnet18', 'mobilenet_v2', 'mobilenet_v3_large', 'efficientnet_b0', 'convnext_tiny', 'resnet50']
 
+# Reverse
+#STUDENTS = ['resnet50', 'convnext_tiny', 'efficientnet_b0', 'mobilenet_v3_large', 'mobilenet_v2', 'resnet18']
+
 # Teacher (open_clip name and pretrained tag)
 TEACHER = 'ViT-L-14'
 PRETRAINED = 'laion2b_s32b_b82k'
