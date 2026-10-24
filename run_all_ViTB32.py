@@ -38,22 +38,22 @@ DATASETS = {
 #          efficientnet_b0, convnext_tiny
 STUDENTS = [
     'resnet18',
-    # 'mobilenet_v2',
-    # 'mobilenet_v3_large',
-    # 'efficientnet_b0',
-    # 'convnext_tiny',
-    # 'resnet50',
+    'mobilenet_v2',
+    'mobilenet_v3_large',
+    'efficientnet_b0',
+    'convnext_tiny',
+    'resnet50',
 ]
 
 # ── Core training settings ────────────────────────────────────────────────────
 # Fix 2: 50 epochs for convergence (v8 convergence check fires at 20)
-EPOCHS_DEFAULT = 10
+EPOCHS_DEFAULT = 1
 
 # Fix 4: 3 seeds for variance analysis (single seed gives NaN std)
-SEEDS = '42' #'42,43,44'
+SEEDS = '42'#'42,43,44'
 
 # Fix 1: all 6 distillation modes including rkd, crd, dkd
-MODES = 'labels,feat,rkd,crd,dkd,vl2lite'
+MODES = 'labels,feat,rkd,crd,dkd,vl2lite,sskd,clipkd'
 
 # Fix 5: explicit dims so pca and erank tokens are always passed
 # Grid starts at 2 so a plateau at the smallest width can be detected (d_1pp < 8)
@@ -85,7 +85,7 @@ def out_folder(dataset: str, student: str, epochs: int, ablation: str = 'main') 
     return Path(RESULTS_ROOT) / f'{dataset}_{student}_e{epochs}{suffix}'
 
 
-def run_state(out: Path) -> str:
+def run_state(out: Path, dataset: str, student: str) -> str:
     """Return 'done', 'resume', or 'new' for an output folder.
 
     'done'   — final analysis exists, is marked complete, nothing is missing, and it
@@ -95,8 +95,8 @@ def run_state(out: Path) -> str:
                never count as finished.
     'new'    — nothing exists yet.
     """
-    summary_csv  = out / 'pareto_summary.csv'
-    per_seed_csv = out / 'results_per_seed.csv'
+    summary_csv  = out / f'{dataset}_{student}_pareto_summary.csv'
+    per_seed_csv = out / f'{dataset}_{student}_results_per_seed.csv'
 
     # A partial analysis (--allow-partial) writes complete: false; never treat it as done.
     try:
@@ -229,7 +229,7 @@ def main():
     for i, (dataset, student, ablation) in enumerate(jobs, 1):
         epochs = EPOCHS_DEFAULT
         out    = out_folder(dataset, student, epochs, ablation)
-        state  = run_state(out)
+        state  = run_state(out,dataset,student)
         script = DATASETS[dataset][0]
         resume = (state == 'resume')
         cmd    = build_command(dataset, student, epochs, out, resume=resume, ablation=ablation)

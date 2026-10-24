@@ -46,6 +46,20 @@ v8 additions to v7
   F4  Incomplete grids stop before analysis unless --allow-partial is given;
       then widths without all seeds are excluded and selection.json says so.
   F5  Training loader uses drop_last, so every batch has the same size.
+  A1  --analyze-only rebuilds the summary and selection from results_per_seed.csv
+      with no training and no GPU, for checking a run in progress. Output goes to
+      interim_*.json/csv; --min-seeds sets how many seeds a width needs (default 1).
+  N1  Mode 'sskd' (SSKD-style, Xu et al. ECCV 2020): CE + logit KD from CLIP zero-shot
+      logits + KL between rotated-vs-original similarity distributions of student
+      (via a small SS head) and frozen CLIP. CLIP features of 90/180/270-degree
+      rotations are cached once when sskd is requested. Costs ~2x student compute.
+  N2  Mode 'clipkd' (CLIP-KD-style, Yang et al. CVPR 2024): CE + feature distillation
+      (MSE to the CLIP image embedding) + interactive contrastive learning (student
+      image embedding vs CLIP class-text embeddings). Affinity mimicking (TinyCLIP)
+      is not part of CLIP-KD and is not included.
+  N3  Teacher references: CLIP zero-shot and a linear probe on frozen CLIP features,
+      saved in teacher_zero_shot.json and selection.json. Reference points, not
+      upper bounds for fine-tuned students.
   Known, not changed in code: modes weight the classification loss differently
       (labels/feat: 1; rkd/crd/dkd/vl2lite: annealed lam_cls 0.5 -> 0.8). Report it
       or run a sensitivity check. DKD uses beta=1 and no warm-up; with no validation split,
@@ -71,6 +85,9 @@ Smoke:
   python fmnist_vl2lite_mle_pareto_v8.py --max-train 2000 --max-test 500 --epochs 2 \\
       --seeds 42 --dims mle,pca,erank,full --modes labels,rkd,crd,dkd,vl2lite \\
       --benchmark-repeats 30 --id-samples 1000 --gpus 0
+
+Check progress of a running/partial experiment (same flags + --analyze-only):
+  python fmnist_vl2lite_mle_pareto_v8.py --out <folder> --analyze-only
 
 Full:
   python fmnist_vl2lite_mle_pareto_v8.py --epochs 50 --seeds 42,43,44 \\
@@ -114,7 +131,7 @@ BACKBONE_DIM = {'resnet18': 512, 'resnet50': 2048, 'mobilenet_v2': 1280,
                 'mobilenet_v3_large': 960, 'efficientnet_b0': 1280, 'convnext_tiny': 768}
 
 # All valid distillation modes
-VALID_MODES = {'labels', 'feat', 'rkd', 'crd', 'dkd', 'vl2lite'}
+VALID_MODES = {'labels', 'feat', 'rkd', 'crd', 'dkd', 'vl2lite', 'sskd', 'clipkd'}
 
 
 def build_backbone(name, pretrained=True):
@@ -152,7 +169,9 @@ SIGNATURE_FIELDS = ['teacher', 'pretrained', 'student', 'no_pretrained_student',
                     'id_samples', 'id_ks', 'optimizer', 'weight_decay',
                     'label_smoothing', 'no_augment',
                     # S1: new fields
-                    'crd_temperature', 'dkd_alpha', 'dkd_beta', 'pca_variance_threshold']
+                    'crd_temperature', 'dkd_alpha', 'dkd_beta', 'pca_variance_threshold',
+                    'sskd_temperature', 'sskd_w_kd', 'sskd_w_ss',
+                    'clipkd_w_fd', 'clipkd_w_icl']
 
 
 def seed_everything(s: int) -> None:
@@ -179,7 +198,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--dims', default='2,4,8,12,16,24,32,48,64,96,128,'
                                      'mle*0.5,mle*0.75,mle,pca,erank,mle*1.25,mle*1.5,full',
                    help="Tokens: integer, 'mle', 'mle*<factor>', 'pca', 'erank', 'full'.")
-    p.add_argument('--modes', default='labels,feat,rkd,crd,dkd,vl2lite',
+    p.add_argument('--modes', default='labels,feat,rkd,crd,dkd,vl2lite,sskd,clipkd',
                    help=f'Comma-separated subset of: {sorted(VALID_MODES)}')
     p.add_argument('--epochs', type=int, default=50)
     p.add_argument('--eval-every', type=int, default=0)
@@ -204,6 +223,14 @@ def make_parser() -> argparse.ArgumentParser:
                    help='F4: analyse an incomplete grid instead of stopping. Widths with fewer '
                         'than the requested seeds are excluded from selection, and '
                         'selection.json is marked "complete": false.')
+    p.add_argument('--analyze-only', action='store_true',
+                   help='A1: no training, no GPU. Rebuild the summary and selection from '
+                        'results_per_seed.csv in --out (use the same --dims/--modes/--seeds '
+                        'as the training command). Writes interim_pareto_summary.csv and '
+                        'interim_selection.json, so finished-run outputs are never overwritten.')
+    p.add_argument('--min-seeds', type=int, default=0,
+                   help='A1: seeds a width needs to be included in selection. 0 = automatic: '
+                        'all requested seeds for a training run, 1 with --analyze-only.')
     p.add_argument('--worker-poll-seconds', type=float, default=30.0,
                    help='M1: how often the parent checks that GPU workers are still alive')
     p.add_argument('--worker-stall-hours', type=float, default=0.0,
@@ -227,6 +254,19 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--dkd-beta', type=float, default=1.0,
                    help='D3: weight for NCKD (non-target-class) term in DKD')
     # B1: PCA variance threshold (S1)
+    # N1: SSKD-style (Xu et al., ECCV 2020)
+    p.add_argument('--sskd-temperature', type=float, default=0.5,
+                   help='N1: temperature of the rotated-vs-original similarity distributions')
+    p.add_argument('--sskd-w-kd', type=float, default=1.0,
+                   help='N1: weight of logit KD from CLIP zero-shot logits on original images')
+    p.add_argument('--sskd-w-ss', type=float, default=1.0,
+                   help='N1: weight of the self-supervision similarity KL')
+    # N2: CLIP-KD-style (Yang et al., CVPR 2024): FD + ICL
+    p.add_argument('--clipkd-w-fd', type=float, default=1.0,
+                   help='N2: weight of feature distillation (MSE to CLIP image embedding)')
+    p.add_argument('--clipkd-w-icl', type=float, default=1.0,
+                   help='N2: weight of interactive contrastive learning '
+                        '(student image embedding vs CLIP class-text embeddings)')
     p.add_argument('--pca-variance-threshold', type=float, default=0.95,
                    help='B1: cumulative variance threshold for PCA dimension selection')
     # Analysis / benchmark
@@ -249,6 +289,19 @@ class FMNISTView(Dataset):
     def __getitem__(self, i):
         img, label = self.base[int(self.indices[i])]
         return self.tf(img.convert('RGB')), int(label), i
+
+
+class FMNISTRotView(FMNISTView):
+    """N1: same images rotated by k x 90 degrees counter-clockwise before the transform,
+    for caching CLIP features of the SSKD rotations. PIL rotate(+90) and
+    torch.rot90(k=1, dims=(-2, -1)) turn a square image the same way."""
+    def __init__(self, base, indices, tf, k):
+        super().__init__(base, indices, tf)
+        self.k = int(k)
+
+    def __getitem__(self, i):
+        img, label = self.base[int(self.indices[i])]
+        return self.tf(img.convert('RGB').rotate(90 * self.k)), int(label), i
 
 
 def balanced_indices(targets, maximum: int, seed: int) -> np.ndarray:
@@ -598,6 +651,43 @@ def dkd_loss(student_logits, teacher_logits, targets, temperature=4.0, alpha=1.0
     return (temperature ** 2) * (alpha * tckd + beta * nckd)
 
 
+def clip_teacher_logits(t_img, t_txt, logit_scale):
+    """Frozen CLIP zero-shot logits: scaled cosine similarity to class-prompt embeddings."""
+    return logit_scale * (F.normalize(t_img.float(), dim=-1) @ F.normalize(t_txt.float(), dim=-1).T)
+
+
+def logit_kd(student_logits, teacher_logits, temperature):
+    """Hinton et al. (2015) KD: T^2 * KL(teacher || student) on softened logits."""
+    return (temperature ** 2) * F.kl_div(F.log_softmax(student_logits / temperature, dim=1),
+                                         F.softmax(teacher_logits / temperature, dim=1),
+                                         reduction='batchmean')
+
+
+def sskd_ss_loss(s_orig, s_rot, t_orig, t_rot, temperature=0.5):
+    """N1/SSKD-style self-supervision transfer (Xu et al., ECCV 2020).
+    Each net builds a similarity distribution of every rotated sample over the original
+    samples in the batch; the student matches the teacher's distribution (KL).
+    Each net is compared in its own space, so no student->teacher projection is needed."""
+    s_o, s_r = F.normalize(s_orig.float(), dim=-1), F.normalize(s_rot.float(), dim=-1)
+    t_o, t_r = F.normalize(t_orig.float(), dim=-1), F.normalize(t_rot.float(), dim=-1)
+    sim_s = s_r @ s_o.T / temperature
+    sim_t = t_r @ t_o.T / temperature
+    return F.kl_div(F.log_softmax(sim_s, dim=1), F.softmax(sim_t, dim=1), reduction='batchmean')
+
+
+def clipkd_losses(z_proj, t_img, t_txt, targets, logit_scale):
+    """N2/CLIP-KD-style (Yang et al., CVPR 2024), adapted to classification:
+    FD  - MSE between the projected student embedding and the CLIP image embedding
+          (both L2-normalised);
+    ICL - the student image embedding is the anchor contrasted against the frozen
+          teacher's class-text embeddings (cross-entropy over classes)."""
+    p = F.normalize(z_proj.float(), dim=-1)
+    t = F.normalize(t_img.float(), dim=-1)
+    fd = (p - t).pow(2).sum(1).mean()
+    icl = F.cross_entropy(logit_scale * p @ F.normalize(t_txt.float(), dim=-1).T, targets)
+    return fd, icl
+
+
 def linguistic_kd(z, t_img, t_txt, cond_text, logit_scale, temp):
     """VL2Lite linguistic loss: KL(teacher image-text || student image-text)."""
     protos = F.normalize(cond_text(t_txt.float()), dim=-1)
@@ -845,7 +935,7 @@ def check_resume_signature(out, a, run_signature):
 
 # ── Training ───────────────────────────────────────────────────────────────────
 def train_one(mode, d_b, seed, kind, teacher_feats, teacher_txt, ds_train, ds_test,
-              vlm_dim, device, a):
+              vlm_dim, device, a, teacher_rot=None):
     """Trains one student and scores it on the test set at the final epoch."""
     seed_everything(seed)
     tag = run_tag(mode, d_b, seed, kind)
@@ -854,6 +944,12 @@ def train_one(mode, d_b, seed, kind, teacher_feats, teacher_txt, ds_train, ds_te
     cond_text = Condense(vlm_dim, d_b).to(device)   # vl2lite only
     align = nn.Linear(d_b, vlm_dim).to(device)       # feat only
     crd_align = nn.Linear(d_b, vlm_dim).to(device)   # crd only: projects to teacher dim
+    clip_align = nn.Linear(d_b, vlm_dim).to(device)  # clipkd only: projects to CLIP space
+    ss_dim = 128
+    ss_head = nn.Sequential(nn.Linear(d_b, max(d_b, ss_dim)), nn.ReLU(inplace=True),
+                            nn.Linear(max(d_b, ss_dim), ss_dim)).to(device)  # sskd only
+    if mode == 'sskd' and teacher_rot is None:
+        raise ValueError('mode sskd needs rotated teacher features (teacher_rot)')
 
     backbone_params = list(student.backbone.parameters())
     head_params = list(student.bottleneck.parameters()) + list(student.classifier.parameters())
@@ -863,6 +959,10 @@ def train_one(mode, d_b, seed, kind, teacher_feats, teacher_txt, ds_train, ds_te
         head_params += list(align.parameters())
     elif mode == 'crd':
         head_params += list(crd_align.parameters())
+    elif mode == 'clipkd':
+        head_params += list(clip_align.parameters())
+    elif mode == 'sskd':
+        head_params += list(ss_head.parameters())
     params = backbone_params + head_params
 
     groups = [{'params': backbone_params, 'lr': a.lr},
@@ -889,6 +989,7 @@ def train_one(mode, d_b, seed, kind, teacher_feats, teacher_txt, ds_train, ds_te
 
     for epoch in range(a.epochs):
         student.train(); cond_text.train(); align.train()
+        crd_align.train(); clip_align.train(); ss_head.train()
         frac = epoch / max(a.epochs - 1, 1)
         lam_cls = a.lam_cls_start + (a.lam_cls_end - a.lam_cls_start) * frac
         lam_kd = (1.0 - lam_cls) / 2.0
@@ -925,10 +1026,7 @@ def train_one(mode, d_b, seed, kind, teacher_feats, teacher_txt, ds_train, ds_te
 
             elif mode == 'dkd':
                 # D3: decoupled KD — use scaled teacher logits + ground-truth targets
-                teacher_logits = (
-                    a.kd_logit_scale_used
-                    * (F.normalize(t_img.float(), dim=-1)
-                       @ F.normalize(t_txt.float(), dim=-1).T))
+                teacher_logits = clip_teacher_logits(t_img, t_txt, a.kd_logit_scale_used)
                 l_dkd = dkd_loss(student_logits=logits,
                                  teacher_logits=teacher_logits,
                                  targets=ys,
@@ -937,6 +1035,27 @@ def train_one(mode, d_b, seed, kind, teacher_feats, teacher_txt, ds_train, ds_te
                                  beta=a.dkd_beta)
                 loss = lam_cls * l_cls + (1.0 - lam_cls) * l_dkd
                 k1, k2 = l_dkd.item(), 0.0
+
+            elif mode == 'sskd':
+                # N1: one random rotation (90/180/270) per sample; teacher features of the
+                # same rotation come from the cache. Logit KD from CLIP zero-shot logits on
+                # the original image + similarity KL between rotated and original samples.
+                ks = torch.randint(1, 4, (xs.size(0),))
+                x_rot = torch.stack([torch.rot90(x, int(k), dims=(-2, -1))
+                                     for x, k in zip(xs, ks)])
+                z_rot, _ = student(x_rot, return_bottleneck=True)
+                t_rot = teacher_rot[ks - 1, ix].to(device)
+                l_kd = logit_kd(logits, clip_teacher_logits(t_img, t_txt, a.kd_logit_scale_used),
+                                a.temperature)
+                l_ss = sskd_ss_loss(ss_head(z), ss_head(z_rot), t_img, t_rot, a.sskd_temperature)
+                loss = lam_cls * l_cls + (1.0 - lam_cls) * (a.sskd_w_kd * l_kd + a.sskd_w_ss * l_ss)
+                k1, k2 = l_kd.item(), l_ss.item()
+
+            elif mode == 'clipkd':
+                # N2: FD + ICL against the frozen CLIP teacher
+                fd, icl = clipkd_losses(clip_align(z), t_img, t_txt, ys, a.kd_logit_scale_used)
+                loss = lam_cls * l_cls + (1.0 - lam_cls) * (a.clipkd_w_fd * fd + a.clipkd_w_icl * icl)
+                k1, k2 = fd.item(), icl.item()
 
             else:  # vl2lite
                 # F1: VL2Lite-style keeps its original distance-only relational term
@@ -1015,7 +1134,8 @@ def _worker(gpu_id, configs, shared, q):
         try:
             q.put(('ok', gpu_id) + train_one(mode, d, seed, kind, shared['teacher_feats'],
                                              shared['teacher_txt'], ds_train, ds_test,
-                                             shared['vlm_dim'], device, a))
+                                             shared['vlm_dim'], device, a,
+                                             teacher_rot=shared.get('teacher_rot')))
         except Exception:
             import traceback
             q.put(('err', gpu_id, run_tag(mode, d, seed, kind), traceback.format_exc()))
@@ -1088,214 +1208,16 @@ def dispatch_workers(worker_fn, gpu_ids, buckets, shared, on_ok, poll_seconds=30
     return lost, failed
 
 
-def code_fingerprint():
-    """F2: hash of everything that defines how a run is trained."""
-    import inspect
-    parts = (relational_kd, crd_loss, dkd_loss, linguistic_kd, feature_kd, flip_consistency,
-             StudentMLE, Condense, train_one, student_transform,
-             balanced_indices, build_backbone)
-    return hashlib.sha256(''.join(inspect.getsource(f) for f in parts).encode()).hexdigest()[:12]
-
-
-# ── Main ───────────────────────────────────────────────────────────────────────
-def run():
-    a = make_parser().parse_args()
-    seeds = [int(s) for s in a.seeds.split(',')]
-    modes = [m.strip() for m in a.modes.split(',')]
-    invalid_modes = set(modes) - VALID_MODES
-    if invalid_modes:
-        raise ValueError(f'Unknown modes: {sorted(invalid_modes)}. Valid: {sorted(VALID_MODES)}')
-    if not 0.0 <= a.label_smoothing < 1.0:
-        raise ValueError('--label-smoothing must be in [0, 1)')
-    if a.epochs < 1 or a.benchmark_trials < 1 or a.benchmark_repeats < 1:
-        raise ValueError('epochs and benchmark trials/repeats must be positive')
-    gpu_ids = [int(g) for g in a.gpus.split(',')]
-    out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
-
-    # F2: the signature covers the training code, not only the CLI settings, so
-    # --resume refuses to mix runs trained under different loss definitions.
-    a.code_fingerprint = code_fingerprint()
-    a.run_signature = hashlib.sha256(json.dumps(
-        {**{k: getattr(a, k) for k in SIGNATURE_FIELDS}, 'code': a.code_fingerprint},
-        sort_keys=True).encode()).hexdigest()[:16]
-    check_resume_signature(out, a, a.run_signature)
-
-    seed_everything(a.data_seed)
-    device = torch.device(f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu')
-    if device.type == 'cuda':
-        torch.cuda.set_device(device)
-    report_gpus(gpu_ids)
-
-    train_base, test_base = load_fmnist(a.data_root, download=True)
-    print(f'Fashion-MNIST: train={len(train_base)}, test={len(test_base)}')
-
-    import open_clip
-    teacher, _, teacher_tf = open_clip.create_model_and_transforms(
-        a.teacher, pretrained=a.pretrained, device=device)
-    tokenizer = open_clip.get_tokenizer(a.teacher)
-    teacher.eval(); teacher.requires_grad_(False)
-
-    # NV: no validation split; students train on the full (optionally capped) training pool
-    train_ix = balanced_indices(labels_of(train_base), a.max_train, a.data_seed)
-    test_ix = balanced_indices(labels_of(test_base), a.max_test, a.data_seed)
-    ds_train = FMNISTView(train_base, train_ix, student_transform(train=True, augment=not a.no_augment))
-    ds_test = FMNISTView(test_base, test_ix, student_transform())
-    print(f'Train/test: {len(ds_train)}/{len(ds_test)}')
-
-    def cache_for(ix, split):
-        sig = hashlib.sha256(ix.tobytes() + f'{a.teacher}/{a.pretrained}/FMNIST/{split}'.encode()).hexdigest()[:16]
-        return out / f'teacher_{split}_{a.teacher}_{a.pretrained}_{sig}.pt'.replace('/', '_')
-
-    teacher_feats = build_teacher_cache(teacher, FMNISTView(train_base, train_ix, teacher_tf),
-                                        device, a.extract_batch_size, a.num_workers,
-                                        cache_for(train_ix, 'train'), a.extract_save_every)
-    teacher_test = build_teacher_cache(teacher, FMNISTView(test_base, test_ix, teacher_tf),
-                                       device, a.extract_batch_size, a.num_workers,
-                                       cache_for(test_ix, 'test'), a.extract_save_every)
-    teacher_txt = encode_class_prompts(teacher, tokenizer, device)
-    clip_scale = float(teacher.logit_scale.exp().item())
-    a.kd_logit_scale_used = clip_scale if a.kd_logit_scale is None else float(a.kd_logit_scale)
-    if a.kd_logit_scale is not None and a.kd_logit_scale < 0.5 * clip_scale:
-        print(f'WARNING: --kd-logit-scale {a.kd_logit_scale} far below CLIP scale {clip_scale:.1f}; '
-              'teacher targets will be near-uniform. Report as ablation.')
-    vlm_dim = teacher_feats.shape[1]
-
-    y_train = labels_of(train_base)[train_ix]
-    y_test = labels_of(test_base)[test_ix]
-    zs = {'train_zero_shot_pct': zero_shot_accuracy(teacher_feats, teacher_txt, y_train),
-          'test_zero_shot_pct': zero_shot_accuracy(teacher_test, teacher_txt, y_test),
-          'clip_logit_scale': clip_scale, 'kd_logit_scale_used': a.kd_logit_scale_used,
-          'templates': PROMPT_TEMPLATES, 'class_prompt_names': PROMPT_NAMES}
-    (out / 'teacher_zero_shot.json').write_text(json.dumps(zs, indent=2))
-    print(f"Teacher feats {tuple(teacher_feats.shape)}, CLIP scale {clip_scale:.1f}, "
-          f"KD scale {a.kd_logit_scale_used:.1f}, zero-shot test {zs['test_zero_shot_pct']:.2f}%")
-
-    # ── Dimensionality estimation (B1, B2, MLE) ───────────────────────────────
-    id_table = mle_dimension(teacher_feats, a.id_ks, a.id_samples, a.data_seed)
-    id_table.to_csv(out / 'levina_bickel_mle.csv', index=False)
-    mle_float = float(id_table['mle_id'].median())
-    mle_d = max(2, min(vlm_dim, math.ceil(mle_float)))
-    stab = mle_stability(teacher_feats, a.id_ks, a.id_samples, a.data_seed, a.id_repeats)
-
-    # P1: primary PCA / effective rank on the same L2-normalised space as the MLE;
-    # raw-feature values are recorded as an ablation.
-    pca_d = max(2, min(vlm_dim, pca_dimension(teacher_feats, a.pca_variance_threshold)))
-    erank_d = max(2, min(vlm_dim, effective_rank_dimension(teacher_feats)))
-    pca_d_raw = max(2, min(vlm_dim, pca_dimension(teacher_feats, a.pca_variance_threshold,
-                                                  normalize=False)))
-    erank_d_raw = max(2, min(vlm_dim, effective_rank_dimension(teacher_feats, normalize=False)))
-    fixed_widths = fixed_widths_for(BACKBONE_DIM[a.student])                  # B3
-
-    print(id_table.to_string(index=False))
-    print(f"MLE d={mle_d} (stability {stab['mean']:.2f} +/- {stab['std']:.2f}) | "
-          f"PCA d={pca_d} (raw {pca_d_raw}) | Effective rank d={erank_d} (raw {erank_d_raw}) | "
-          f"Fixed widths {fixed_widths}")
-
-    (out / 'dimension_estimates.json').write_text(json.dumps({           # B7
-        'mle_d': mle_d, 'mle_float': mle_float, 'mle_stability': stab,
-        'feature_space': 'L2-normalised CLIP image embeddings (MLE, PCA, effective rank)',
-        'pca_d': pca_d, 'pca_variance_threshold': a.pca_variance_threshold,
-        'erank_d': erank_d,
-        'ablation_raw_features': {'pca_d': pca_d_raw, 'erank_d': erank_d_raw},
-        'fixed_widths': fixed_widths, 'fixed_width_grid': FIXED_WIDTHS_INDEPENDENT,
-        'vlm_dim': vlm_dim,
-    }, indent=2))
-    (out / 'mle_summary.json').write_text(json.dumps(
-        {'mle_by_k': id_table.to_dict('records'), 'mle_median': mle_float, 'mle_d': mle_d,
-         'stability': stab, 'num_classes_minus_1': NUM_CLASSES - 1}, indent=2))
-
-    del teacher
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
-
-    # B5: parse dims with pca and erank tokens; fixed widths are always included
-    full_d = BACKBONE_DIM[a.student]
-    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, full_d, fixed_widths)
-    configs = [(m, d, s, 'linear') for s in seeds for d in dims for m in modes]
-    if not a.no_identity_baseline:                                            # G1
-        configs += [(m, full_d, s, 'identity') for s in seeds for m in modes]
-    print(f'Dims {dims} (+ identity baseline at {full_d}: {not a.no_identity_baseline}) | '
-          f'modes {modes} | seeds {seeds} | {len(configs)} runs on GPUs {gpu_ids}')
-
-    done_rows = []
-    if a.resume and (out / 'results_per_seed.csv').exists():
-        prev = pd.read_csv(out / 'results_per_seed.csv')
-        done = {t for t in prev['tag'] if (out / f'{t}.pt').exists()}
-        done_rows = prev[prev['tag'].isin(done)].to_dict('records')
-        configs = [c for c in configs if run_tag(*c) not in done]
-        print(f'Resume: reusing {len(done_rows)} finished runs, {len(configs)} left to train')
-
-    results, curves_all, bench_rows = list(done_rows), [], []
-    for r in done_rows:
-        hist = out / f"{r['tag']}_history.csv"
-        if hist.exists():
-            curves_all.extend(pd.read_csv(hist).to_dict('records'))
-
-    def collect(res, bench, curves):
-        results.append(res); curves_all.extend(curves)
-        if bench:
-            bench_rows.extend(bench_trial_rows(res['tag'], bench))
-        pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
-
-    lost, failed = [], {}
-    if len(gpu_ids) == 1 or device.type != 'cuda':
-        for cfg in configs:
-            try:
-                collect(*train_one(*cfg, teacher_feats, teacher_txt, ds_train, ds_test,
-                                   vlm_dim, device, a))
-            except Exception:                                                  # P6
-                import traceback
-                failed[run_tag(*cfg)] = traceback.format_exc()
-                print(f'[ERROR] {run_tag(*cfg)}\n{failed[run_tag(*cfg)]}', flush=True)
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
-    elif configs:
-        shared = {'a': a, 'teacher_feats': teacher_feats, 'teacher_txt': teacher_txt,
-                  'vlm_dim': vlm_dim, 'train_ids': train_ix, 'test_ids': test_ix}
-        buckets = [configs[i::len(gpu_ids)] for i in range(len(gpu_ids))]
-        lost, failed = dispatch_workers(_worker, gpu_ids, buckets, shared, collect,
-                                        poll_seconds=a.worker_poll_seconds,
-                                        stall_seconds=a.worker_stall_hours * 3600)
-    (out / 'lost_runs.json').write_text(json.dumps(lost, indent=2))
-    (out / 'failed_runs.json').write_text(json.dumps(failed, indent=2))
-    if lost or failed:
-        print(f'WARNING: {len(lost)} lost and {len(failed)} failed run(s); see lost_runs.json '
-              'and failed_runs.json. Rerun the same command with --resume to retry them.',
-              flush=True)
-
-    wanted = {run_tag(m, d, s) for s in seeds for d in dims for m in modes}
-    if not a.no_identity_baseline:
-        wanted |= {run_tag(m, full_d, s, 'identity') for s in seeds for m in modes}
-    results = [r for r in results if r['tag'] in wanted]
-    for r in results:                       # rows resumed from older runs
-        r.setdefault('bottleneck_kind', 'linear')
-    # Persist completed checkpoints/results before checking completeness. Do not
-    # publish an oracle or Pareto analysis from a partial dimension x seed grid
-    # unless --allow-partial is given (F4).
-    pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
-    missing_tags = sorted(wanted - {r['tag'] for r in results})
-    (out / 'missing_runs.json').write_text(json.dumps(missing_tags, indent=2))
-    complete = not (lost or failed or missing_tags)
-    if not complete and not a.allow_partial:
-        raise RuntimeError(
-            f'Incomplete experiment: {len(failed)} failed, {len(lost)} lost, '
-            f'{len(missing_tags)} missing configuration(s). Completed checkpoints '
-            f'and results_per_seed.csv are preserved under {out}. '
-            'Correct the failures and rerun with --resume, or pass --allow-partial; '
-            'selection/oracle results have NOT been generated from this partial grid.')
-    if not complete:
-        print(f'WARNING: --allow-partial: analysing an incomplete grid ({len(missing_tags)} '
-              'missing run(s)). Widths without all seeds are excluded from selection.',
-              flush=True)
-    if not results:
-        raise RuntimeError('No configuration finished; see [ERROR] messages above.')
-    if a.benchmark == 'after':
-        print('\nBenchmarking saved models sequentially on an idle GPU ...')
-        bench_rows = benchmark_saved(results, out, device, a)
-    (out / 'hardware.json').write_text(json.dumps(hardware_info(device, a), indent=2))  # P6
-
-    pd.DataFrame(curves_all).to_csv(out / 'training_history.csv', index=False)
-    pd.DataFrame(bench_rows).to_csv(out / 'benchmark_trials.csv', index=False)
+def analyze_and_write(results, info, a, out, prefix=''):
+    """Summary, Pareto, strategy comparison and selection.json from finished runs.
+    Shared by a normal training run (prefix='') and --analyze-only (prefix='interim_').
+    Needs no GPU and no dataset."""
+    seeds, modes = info['seeds'], info['modes']
+    mle_d, pca_d, erank_d = info['mle_d'], info['pca_d'], info['erank_d']
+    pca_d_raw, erank_d_raw = info['pca_d_raw'], info['erank_d_raw']
+    fixed_widths, full_d, vlm_dim = info['fixed_widths'], info['full_d'], info['vlm_dim']
+    stab, zs, split_sizes = info['stab'], info['zs'], info['split_sizes']
+    complete, missing_tags, min_seeds = info['complete'], info['missing_tags'], info['min_seeds']
 
     # ── Summary on test accuracy (no validation split) ─────────────────────────
     frame = pd.DataFrame(results)
@@ -1312,7 +1234,7 @@ def run():
         n_seeds=('seed', 'count')).reset_index()
 
     lin = summary['bottleneck_kind'].eq('linear')
-    all_seeds = summary['n_seeds'] >= expected          # F4: only complete groups are selectable
+    all_seeds = summary['n_seeds'] >= min_seeds         # F4/A1: groups with enough seeds
     excluded = summary.loc[~all_seeds, ['mode', 'bottleneck_kind', 'bottleneck_d', 'n_seeds']]
     summary['mle_selected'] = lin & summary['bottleneck_d'].eq(mle_d)
     summary['pca_selected'] = lin & summary['bottleneck_d'].eq(pca_d)
@@ -1379,9 +1301,9 @@ def run():
                 'test_accuracy_std': float(idr['test_accuracy_std'].iloc[0]),
                 'gap_to_best_linear_pp': best - id_acc}
 
-    summary.to_csv(out / 'pareto_summary.csv', index=False)
+    summary.to_csv(out / f'{prefix}pareto_summary.csv', index=False)
 
-    (out / 'selection.json').write_text(json.dumps({
+    (out / f'{prefix}selection.json').write_text(json.dumps({
         'dataset': 'FashionMNIST',
         'num_classes_minus_1': NUM_CLASSES - 1,
         'dimension_estimates': {
@@ -1399,7 +1321,9 @@ def run():
         'excluded_incomplete_groups': excluded.to_dict('records'),
         'accuracy_tolerance_pp': a.accuracy_tolerance,
         'selection_split': 'test (no validation split; post-hoc analysis)',
-        'split_sizes': {'train': int(len(train_ix)), 'test': int(len(test_ix))},
+        'split_sizes': split_sizes,
+        'min_seeds_for_selection': min_seeds,
+        'analysis': 'interim (--analyze-only)' if prefix else 'final',
         'student_augmentation': 'none (matched views)' if a.no_augment else
                                 'RandomResizedCrop(0.72-1.0) + flip; teacher features from '
                                 'un-augmented images (run --no-augment for the matched-view ablation)',
@@ -1421,6 +1345,14 @@ def run():
             'rkd': 'Park et al., RKD, CVPR 2019 (distance + angle)',
             'crd': 'Tian et al., CRD, ICLR 2020 (in-batch contrastive variant)',
             'dkd': 'Zhao et al., DKD, CVPR 2022 (DKD-style: beta=1 by default, no warm-up)',
+            'sskd': ('Xu et al., Knowledge Distillation Meets Self-Supervision (SSKD), ECCV 2020 '
+                     '(SSKD-style: frozen CLIP teacher without its own SS module, one random '
+                     'rotation per sample, logit KD on original images only)'),
+            'clipkd': ('Yang et al., CLIP-KD: An Empirical Study of CLIP Model Distillation, '
+                       'CVPR 2024 (CLIP-KD-style: FD + ICL adapted to classification; ICL '
+                       'contrasts the student image embedding with CLIP class-text embeddings)'),
+            'zero_shot_clip': ('Radford et al., CLIP, ICML 2021: frozen teacher zero-shot and '
+                               'linear-probe accuracy (teacher_zero_shot in this file)'),
             'vl2lite': 'VL2Lite-style: distance-only relational (weight 1) + linguistic KD',
         },
         'note': ('No validation split was used. Bottleneck selection, d_eps, knee_d and '
@@ -1430,11 +1362,318 @@ def run():
                  'models, and refer to the measured hardware (hardware.json).'),
     }, indent=2))
 
-    (out / 'config.json').write_text(json.dumps(
-        {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}, indent=2))
-
     print(summary.to_string(index=False))
     print(json.dumps(selection, indent=2))
+    return summary, selection
+
+
+def analyze_only(a, seeds, modes, out):
+    """A1: rebuild the analysis from results_per_seed.csv without training or a GPU."""
+    need = ['results_per_seed.csv', 'dimension_estimates.json']
+    missing = [f for f in need if not (out / f).exists()]
+    if missing:
+        raise FileNotFoundError(f'--analyze-only needs {missing} in {out}; '
+                                'run training first (it writes them before the first run).')
+    cfg_path = out / 'config.json'
+    if cfg_path.exists():
+        trained = json.loads(cfg_path.read_text()).get('student')
+        if trained and trained != a.student:
+            raise ValueError(f'{out} was trained with --student {trained}, not {a.student}.')
+    est = json.loads((out / 'dimension_estimates.json').read_text())
+    zs_path = out / 'teacher_zero_shot.json'
+    zs = json.loads(zs_path.read_text()) if zs_path.exists() else {}
+    full_d = BACKBONE_DIM[a.student]
+    mle_d, pca_d, erank_d = int(est['mle_d']), int(est['pca_d']), int(est['erank_d'])
+    raw = est.get('ablation_raw_features', {})
+    fixed_widths = est.get('fixed_widths') or fixed_widths_for(full_d)
+    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, full_d, fixed_widths)
+
+    frame = pd.read_csv(out / 'results_per_seed.csv')
+    sig_file = out / 'run_signature.txt'
+    if sig_file.exists() and 'run_signature' in frame:
+        sig = sig_file.read_text().strip()
+        other = frame['run_signature'].astype(str) != sig
+        if other.any():
+            print(f'WARNING: ignoring {int(other.sum())} row(s) from a different run signature.')
+            frame = frame[~other]
+        a.run_signature = sig
+    else:
+        a.run_signature = 'unknown'
+    a.code_fingerprint = 'not checked (--analyze-only)'
+    results = frame.to_dict('records')
+    for r in results:
+        if not isinstance(r.get('bottleneck_kind'), str):
+            r['bottleneck_kind'] = 'linear'
+        for k in BENCH_KEYS:
+            r.setdefault(k, float('nan'))
+
+    wanted = {run_tag(m, d, s) for s in seeds for d in dims for m in modes}
+    if not a.no_identity_baseline:
+        wanted |= {run_tag(m, full_d, s, 'identity') for s in seeds for m in modes}
+    results = [r for r in results if r['tag'] in wanted]
+    if not results:
+        raise RuntimeError('No finished run in results_per_seed.csv matches the requested '
+                           '--dims/--modes/--seeds.')
+    missing_tags = sorted(wanted - {r['tag'] for r in results})
+    (out / 'interim_missing_runs.json').write_text(json.dumps(missing_tags, indent=2))
+    done_d = sorted({int(r['bottleneck_d']) for r in results if r['bottleneck_kind'] == 'linear'})
+    print(f'--analyze-only: {len(results)} finished / {len(wanted)} requested run(s); '
+          f'widths so far {done_d}; MLE d={mle_d}')
+
+    info = {'seeds': seeds, 'modes': modes, 'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d,
+            'pca_d_raw': raw.get('pca_d'), 'erank_d_raw': raw.get('erank_d'),
+            'fixed_widths': fixed_widths, 'full_d': full_d, 'vlm_dim': est.get('vlm_dim'),
+            'stab': est.get('mle_stability', {}), 'zs': zs,
+            'split_sizes': est.get('split_sizes', 'unknown'),
+            'complete': not missing_tags, 'missing_tags': missing_tags,
+            'min_seeds': a.min_seeds or 1}
+    return analyze_and_write(results, info, a, out, prefix='interim_')
+
+
+def code_fingerprint():
+    """F2: hash of everything that defines how a run is trained."""
+    import inspect
+    parts = (relational_kd, crd_loss, dkd_loss, linguistic_kd, feature_kd, flip_consistency,
+             clip_teacher_logits, logit_kd, sskd_ss_loss, clipkd_losses, FMNISTRotView,
+             StudentMLE, Condense, train_one, student_transform,
+             balanced_indices, build_backbone)
+    return hashlib.sha256(''.join(inspect.getsource(f) for f in parts).encode()).hexdigest()[:12]
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def run():
+    a = make_parser().parse_args()
+    seeds = [int(s) for s in a.seeds.split(',')]
+    modes = [m.strip() for m in a.modes.split(',')]
+    invalid_modes = set(modes) - VALID_MODES
+    if invalid_modes:
+        raise ValueError(f'Unknown modes: {sorted(invalid_modes)}. Valid: {sorted(VALID_MODES)}')
+    if not 0.0 <= a.label_smoothing < 1.0:
+        raise ValueError('--label-smoothing must be in [0, 1)')
+    if a.epochs < 1 or a.benchmark_trials < 1 or a.benchmark_repeats < 1:
+        raise ValueError('epochs and benchmark trials/repeats must be positive')
+    out = Path(a.out)
+    if a.analyze_only:                                                        # A1
+        analyze_only(a, seeds, modes, out)
+        return
+    gpu_ids = [int(g) for g in a.gpus.split(',')]
+    out.mkdir(parents=True, exist_ok=True)
+
+    # F2: the signature covers the training code, not only the CLI settings, so
+    # --resume refuses to mix runs trained under different loss definitions.
+    a.code_fingerprint = code_fingerprint()
+    a.run_signature = hashlib.sha256(json.dumps(
+        {**{k: getattr(a, k) for k in SIGNATURE_FIELDS}, 'code': a.code_fingerprint},
+        sort_keys=True).encode()).hexdigest()[:16]
+    check_resume_signature(out, a, a.run_signature)
+
+    seed_everything(a.data_seed)
+    device = torch.device(f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu')
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    report_gpus(gpu_ids)
+
+    train_base, test_base = load_fmnist(a.data_root, download=True)
+    print(f'Fashion-MNIST: train={len(train_base)}, test={len(test_base)}')
+
+    import open_clip
+    teacher, _, teacher_tf = open_clip.create_model_and_transforms(
+        a.teacher, pretrained=a.pretrained, device=device)
+    tokenizer = open_clip.get_tokenizer(a.teacher)
+    teacher.eval(); teacher.requires_grad_(False)
+
+    # NV: no validation split; students train on the full (optionally capped) training pool
+    train_ix = balanced_indices(labels_of(train_base), a.max_train, a.data_seed)
+    test_ix = balanced_indices(labels_of(test_base), a.max_test, a.data_seed)
+    ds_train = FMNISTView(train_base, train_ix, student_transform(train=True, augment=not a.no_augment))
+    ds_test = FMNISTView(test_base, test_ix, student_transform())
+    print(f'Train/test: {len(ds_train)}/{len(ds_test)}')
+
+    def cache_for(ix, split):
+        sig = hashlib.sha256(ix.tobytes() + f'{a.teacher}/{a.pretrained}/FMNIST/{split}'.encode()).hexdigest()[:16]
+        return out / f'teacher_{split}_{a.teacher}_{a.pretrained}_{sig}.pt'.replace('/', '_')
+
+    teacher_feats = build_teacher_cache(teacher, FMNISTView(train_base, train_ix, teacher_tf),
+                                        device, a.extract_batch_size, a.num_workers,
+                                        cache_for(train_ix, 'train'), a.extract_save_every)
+    teacher_test = build_teacher_cache(teacher, FMNISTView(test_base, test_ix, teacher_tf),
+                                       device, a.extract_batch_size, a.num_workers,
+                                       cache_for(test_ix, 'test'), a.extract_save_every)
+    teacher_rot = None
+    if 'sskd' in modes:                                                       # N1
+        teacher_rot = torch.stack([
+            build_teacher_cache(teacher, FMNISTRotView(train_base, train_ix, teacher_tf, k),
+                                device, a.extract_batch_size, a.num_workers,
+                                cache_for(train_ix, f'train_rot{90 * k}'), a.extract_save_every)
+            for k in (1, 2, 3)])                                              # (3, N, D)
+    teacher_txt = encode_class_prompts(teacher, tokenizer, device)
+    clip_scale = float(teacher.logit_scale.exp().item())
+    a.kd_logit_scale_used = clip_scale if a.kd_logit_scale is None else float(a.kd_logit_scale)
+    if a.kd_logit_scale is not None and a.kd_logit_scale < 0.5 * clip_scale:
+        print(f'WARNING: --kd-logit-scale {a.kd_logit_scale} far below CLIP scale {clip_scale:.1f}; '
+              'teacher targets will be near-uniform. Report as ablation.')
+    vlm_dim = teacher_feats.shape[1]
+
+    y_train = labels_of(train_base)[train_ix]
+    y_test = labels_of(test_base)[test_ix]
+    zs = {'train_zero_shot_pct': zero_shot_accuracy(teacher_feats, teacher_txt, y_train),
+          'test_zero_shot_pct': zero_shot_accuracy(teacher_test, teacher_txt, y_test),
+          'clip_logit_scale': clip_scale, 'kd_logit_scale_used': a.kd_logit_scale_used,
+          'templates': PROMPT_TEMPLATES, 'class_prompt_names': PROMPT_NAMES}
+    # N3: CLIP teacher references. Zero-shot uses only class prompts; the linear probe
+    # trains a logistic regression on frozen CLIP features of the training set. Neither
+    # is guaranteed to be an upper bound on a fine-tuned CNN student.
+    from sklearn.linear_model import LogisticRegression
+    nrm = lambda f: F.normalize(f.float(), dim=-1).numpy()
+    probe = LogisticRegression(max_iter=2000, C=1.0).fit(nrm(teacher_feats), y_train)
+    zs['train_linear_probe_pct'] = 100.0 * float(probe.score(nrm(teacher_feats), y_train))
+    zs['test_linear_probe_pct'] = 100.0 * float(probe.score(nrm(teacher_test), y_test))
+    zs['reference_note'] = ('CLIP ViT teacher, frozen: zero-shot from class prompts and a '
+                            'logistic-regression linear probe on L2-normalised image features. '
+                            'Reference points, not upper bounds for fine-tuned CNN students.')
+    (out / 'teacher_zero_shot.json').write_text(json.dumps(zs, indent=2))
+    print(f"Teacher feats {tuple(teacher_feats.shape)}, CLIP scale {clip_scale:.1f}, "
+          f"KD scale {a.kd_logit_scale_used:.1f}, zero-shot test {zs['test_zero_shot_pct']:.2f}%, "
+          f"linear probe test {zs['test_linear_probe_pct']:.2f}%")
+
+    # ── Dimensionality estimation (B1, B2, MLE) ───────────────────────────────
+    id_table = mle_dimension(teacher_feats, a.id_ks, a.id_samples, a.data_seed)
+    id_table.to_csv(out / 'levina_bickel_mle.csv', index=False)
+    mle_float = float(id_table['mle_id'].median())
+    mle_d = max(2, min(vlm_dim, math.ceil(mle_float)))
+    stab = mle_stability(teacher_feats, a.id_ks, a.id_samples, a.data_seed, a.id_repeats)
+
+    # P1: primary PCA / effective rank on the same L2-normalised space as the MLE;
+    # raw-feature values are recorded as an ablation.
+    pca_d = max(2, min(vlm_dim, pca_dimension(teacher_feats, a.pca_variance_threshold)))
+    erank_d = max(2, min(vlm_dim, effective_rank_dimension(teacher_feats)))
+    pca_d_raw = max(2, min(vlm_dim, pca_dimension(teacher_feats, a.pca_variance_threshold,
+                                                  normalize=False)))
+    erank_d_raw = max(2, min(vlm_dim, effective_rank_dimension(teacher_feats, normalize=False)))
+    fixed_widths = fixed_widths_for(BACKBONE_DIM[a.student])                  # B3
+
+    print(id_table.to_string(index=False))
+    print(f"MLE d={mle_d} (stability {stab['mean']:.2f} +/- {stab['std']:.2f}) | "
+          f"PCA d={pca_d} (raw {pca_d_raw}) | Effective rank d={erank_d} (raw {erank_d_raw}) | "
+          f"Fixed widths {fixed_widths}")
+
+    (out / 'dimension_estimates.json').write_text(json.dumps({           # B7
+        'mle_d': mle_d, 'mle_float': mle_float, 'mle_stability': stab,
+        'feature_space': 'L2-normalised CLIP image embeddings (MLE, PCA, effective rank)',
+        'pca_d': pca_d, 'pca_variance_threshold': a.pca_variance_threshold,
+        'erank_d': erank_d,
+        'ablation_raw_features': {'pca_d': pca_d_raw, 'erank_d': erank_d_raw},
+        'fixed_widths': fixed_widths, 'fixed_width_grid': FIXED_WIDTHS_INDEPENDENT,
+        'vlm_dim': vlm_dim,
+        'split_sizes': {'train': int(len(train_ix)), 'test': int(len(test_ix))},
+    }, indent=2))
+    (out / 'mle_summary.json').write_text(json.dumps(
+        {'mle_by_k': id_table.to_dict('records'), 'mle_median': mle_float, 'mle_d': mle_d,
+         'stability': stab, 'num_classes_minus_1': NUM_CLASSES - 1}, indent=2))
+
+    del teacher
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+    # B5: parse dims with pca and erank tokens; fixed widths are always included
+    full_d = BACKBONE_DIM[a.student]
+    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, full_d, fixed_widths)
+    configs = [(m, d, s, 'linear') for s in seeds for d in dims for m in modes]
+    if not a.no_identity_baseline:                                            # G1
+        configs += [(m, full_d, s, 'identity') for s in seeds for m in modes]
+    print(f'Dims {dims} (+ identity baseline at {full_d}: {not a.no_identity_baseline}) | '
+          f'modes {modes} | seeds {seeds} | {len(configs)} runs on GPUs {gpu_ids}')
+
+    done_rows = []
+    if a.resume and (out / 'results_per_seed.csv').exists():
+        prev = pd.read_csv(out / 'results_per_seed.csv')
+        done = {t for t in prev['tag'] if (out / f'{t}.pt').exists()}
+        done_rows = prev[prev['tag'].isin(done)].to_dict('records')
+        configs = [c for c in configs if run_tag(*c) not in done]
+        print(f'Resume: reusing {len(done_rows)} finished runs, {len(configs)} left to train')
+
+    results, curves_all, bench_rows = list(done_rows), [], []
+    for r in done_rows:
+        hist = out / f"{r['tag']}_history.csv"
+        if hist.exists():
+            curves_all.extend(pd.read_csv(hist).to_dict('records'))
+
+    def collect(res, bench, curves):
+        results.append(res); curves_all.extend(curves)
+        if bench:
+            bench_rows.extend(bench_trial_rows(res['tag'], bench))
+        pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
+
+    lost, failed = [], {}
+    if len(gpu_ids) == 1 or device.type != 'cuda':
+        for cfg in configs:
+            try:
+                collect(*train_one(*cfg, teacher_feats, teacher_txt, ds_train, ds_test,
+                                   vlm_dim, device, a, teacher_rot=teacher_rot))
+            except Exception:                                                  # P6
+                import traceback
+                failed[run_tag(*cfg)] = traceback.format_exc()
+                print(f'[ERROR] {run_tag(*cfg)}\n{failed[run_tag(*cfg)]}', flush=True)
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+    elif configs:
+        shared = {'a': a, 'teacher_feats': teacher_feats, 'teacher_txt': teacher_txt,
+                  'vlm_dim': vlm_dim, 'train_ids': train_ix, 'test_ids': test_ix,
+                  'teacher_rot': teacher_rot}
+        buckets = [configs[i::len(gpu_ids)] for i in range(len(gpu_ids))]
+        lost, failed = dispatch_workers(_worker, gpu_ids, buckets, shared, collect,
+                                        poll_seconds=a.worker_poll_seconds,
+                                        stall_seconds=a.worker_stall_hours * 3600)
+    (out / 'lost_runs.json').write_text(json.dumps(lost, indent=2))
+    (out / 'failed_runs.json').write_text(json.dumps(failed, indent=2))
+    if lost or failed:
+        print(f'WARNING: {len(lost)} lost and {len(failed)} failed run(s); see lost_runs.json '
+              'and failed_runs.json. Rerun the same command with --resume to retry them.',
+              flush=True)
+
+    wanted = {run_tag(m, d, s) for s in seeds for d in dims for m in modes}
+    if not a.no_identity_baseline:
+        wanted |= {run_tag(m, full_d, s, 'identity') for s in seeds for m in modes}
+    results = [r for r in results if r['tag'] in wanted]
+    for r in results:                       # rows resumed from older runs
+        r.setdefault('bottleneck_kind', 'linear')
+    # Persist completed checkpoints/results before checking completeness. Do not
+    # publish an oracle or Pareto analysis from a partial dimension x seed grid
+    # unless --allow-partial is given (F4).
+    pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
+    missing_tags = sorted(wanted - {r['tag'] for r in results})
+    (out / 'missing_runs.json').write_text(json.dumps(missing_tags, indent=2))
+    complete = not (lost or failed or missing_tags)
+    if not complete and not a.allow_partial:
+        raise RuntimeError(
+            f'Incomplete experiment: {len(failed)} failed, {len(lost)} lost, '
+            f'{len(missing_tags)} missing configuration(s). Completed checkpoints '
+            f'and results_per_seed.csv are preserved under {out}. '
+            'Correct the failures and rerun with --resume, or pass --allow-partial; '
+            'selection/oracle results have NOT been generated from this partial grid.')
+    if not complete:
+        print(f'WARNING: --allow-partial: analysing an incomplete grid ({len(missing_tags)} '
+              'missing run(s)). Widths without all seeds are excluded from selection.',
+              flush=True)
+    if not results:
+        raise RuntimeError('No configuration finished; see [ERROR] messages above.')
+    if a.benchmark == 'after':
+        print('\nBenchmarking saved models sequentially on an idle GPU ...')
+        bench_rows = benchmark_saved(results, out, device, a)
+    (out / 'hardware.json').write_text(json.dumps(hardware_info(device, a), indent=2))  # P6
+
+    pd.DataFrame(curves_all).to_csv(out / 'training_history.csv', index=False)
+    pd.DataFrame(bench_rows).to_csv(out / 'benchmark_trials.csv', index=False)
+
+    info = {'seeds': seeds, 'modes': modes, 'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d,
+            'pca_d_raw': pca_d_raw, 'erank_d_raw': erank_d_raw, 'fixed_widths': fixed_widths,
+            'full_d': full_d, 'vlm_dim': vlm_dim, 'stab': stab, 'zs': zs,
+            'split_sizes': {'train': int(len(train_ix)), 'test': int(len(test_ix))},
+            'complete': complete, 'missing_tags': missing_tags,
+            'min_seeds': a.min_seeds or len(seeds)}
+    analyze_and_write(results, info, a, out)
+    (out / 'config.json').write_text(json.dumps(
+        {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}, indent=2))
 
 
 if __name__ == '__main__':
