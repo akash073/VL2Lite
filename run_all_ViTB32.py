@@ -45,6 +45,10 @@ STUDENTS = [
     'resnet50',
 ]
 
+
+
+#STUDENTS = ['resnet50', 'convnext_tiny', 'efficientnet_b0', 'mobilenet_v3_large', 'mobilenet_v2', 'resnet18']
+
 # ── Core training settings ────────────────────────────────────────────────────
 # Fix 2: 50 epochs for convergence (v8 convergence check fires at 20)
 EPOCHS_DEFAULT = 1
