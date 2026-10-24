@@ -14,6 +14,7 @@ needing extra seeds/modes) continue with --resume.
 """
 import argparse
 import csv
+import json
 import os
 import subprocess
 import sys
@@ -38,29 +39,36 @@ DATASETS = {
 STUDENTS = [
     'resnet18',
     # 'mobilenet_v2',
-
     # 'mobilenet_v3_large',
     # 'efficientnet_b0',
-    
     # 'convnext_tiny',
     # 'resnet50',
 ]
 
 # ── Core training settings ────────────────────────────────────────────────────
 # Fix 2: 50 epochs for convergence (v8 convergence check fires at 20)
-EPOCHS_DEFAULT = 20
+EPOCHS_DEFAULT = 10
 
 # Fix 4: 3 seeds for variance analysis (single seed gives NaN std)
-SEEDS = '42' # 42,43,44
+SEEDS = '42' #'42,43,44'
 
 # Fix 1: all 6 distillation modes including rkd, crd, dkd
 MODES = 'labels,feat,rkd,crd,dkd,vl2lite'
 
 # Fix 5: explicit dims so pca and erank tokens are always passed
-DIMS = '8,mle*0.5,mle*0.75,mle,pca,erank,mle*1.25,mle*1.5,32,128,full'
+# Grid starts at 2 so a plateau at the smallest width can be detected (d_1pp < 8)
+DIMS = ('2,4,8,12,16,24,32,48,64,96,128,'
+        'mle*0.5,mle*0.75,mle,pca,erank,mle*1.25,mle*1.5,full')
+
+# Ablations: each gets its own output folder. 'main' uses student-only augmentation;
+# 'matched_views' trains on un-augmented images, so teacher and student see the same view.
+ABLATIONS = {
+    'main':          [],
+    'matched_views': ['--no-augment'],
+}
 
 GPUS = '0'          # e.g. '0,1' for two GPUs
-#NUM_WORKERS = 2     # dataloader workers per run
+NUM_WORKERS = 2     # dataloader workers per run
 
 # Extra flags added to EVERY run — add ablations here if needed
 # e.g. ['--label-smoothing', '0', '--no-augment']
@@ -72,19 +80,40 @@ SKIP_FINISHED = True        # skip runs whose pareto_summary.csv is complete
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-def out_folder(dataset: str, student: str, epochs: int) -> Path:
-    return Path(RESULTS_ROOT) / f'{dataset}_{student}_e{epochs}'
+def out_folder(dataset: str, student: str, epochs: int, ablation: str = 'main') -> Path:
+    suffix = '' if ablation == 'main' else f'_{ablation}'
+    return Path(RESULTS_ROOT) / f'{dataset}_{student}_e{epochs}{suffix}'
 
 
 def run_state(out: Path) -> str:
     """Return 'done', 'resume', or 'new' for an output folder.
 
-    'done'   — pareto_summary.csv exists with enough seeds and all requested modes.
-    'resume' — results_per_seed.csv exists but run is incomplete.
+    'done'   — final analysis exists, is marked complete, nothing is missing, and it
+               covers enough seeds and all requested modes.
+    'resume' — results_per_seed.csv exists but the run is incomplete, or the analysis
+               was produced with --allow-partial. interim_* files from --analyze-only
+               never count as finished.
     'new'    — nothing exists yet.
     """
     summary_csv  = out / 'pareto_summary.csv'
     per_seed_csv = out / 'results_per_seed.csv'
+
+    # A partial analysis (--allow-partial) writes complete: false; never treat it as done.
+    try:
+        sel = json.loads((out / 'selection.json').read_text(encoding='utf-8'))
+        if sel.get('complete') is False:
+            return 'resume'
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return 'resume'
+    try:
+        if json.loads((out / 'missing_runs.json').read_text(encoding='utf-8')):
+            return 'resume'
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return 'resume'
 
     if summary_csv.exists():
         try:
@@ -113,7 +142,8 @@ def run_state(out: Path) -> str:
     return 'resume' if per_seed_csv.exists() else 'new'
 
 
-def build_command(dataset: str, student: str, epochs: int, out: Path, resume: bool) -> list:
+def build_command(dataset: str, student: str, epochs: int, out: Path, resume: bool,
+                  ablation: str = 'main') -> list:
     """Build the subprocess command for one (dataset, student) run."""
     script, dataset_flags = DATASETS[dataset]
     cmd = [
@@ -124,11 +154,13 @@ def build_command(dataset: str, student: str, epochs: int, out: Path, resume: bo
         '--modes',       MODES,
         '--dims',        DIMS,          # Fix 5: always pass dims explicitly
         '--gpus',        GPUS,
+        '--num-workers', str(NUM_WORKERS),
         '--data-root',   DATA_ROOT,
         '--out',         str(out),
     ]
     cmd += list(dataset_flags)
     cmd += list(EXTRA_FLAGS)
+    cmd += list(ABLATIONS[ablation])
     if resume:
         cmd.append('--resume')
     return cmd
@@ -175,12 +207,14 @@ def main():
         sys.exit(f'Training script(s) not found in {Path.cwd()}:\n  ' +
                  '\n  '.join(missing))
 
-    jobs = [(dataset, student) for dataset in DATASETS for student in STUDENTS]
+    jobs = [(dataset, student, abl) for abl in ABLATIONS for dataset in DATASETS
+            for student in STUDENTS]
     Path(RESULTS_ROOT).mkdir(parents=True, exist_ok=True)
 
     print_separator()
     print(f'Experiments  : {len(jobs)}  '
-          f'({len(DATASETS)} dataset(s) x {len(STUDENTS)} student model(s))')
+          f'({len(DATASETS)} dataset(s) x {len(STUDENTS)} student model(s) x '
+          f'{len(ABLATIONS)} ablation(s): {list(ABLATIONS)})')
     print(f'Seeds        : {SEEDS}')
     print(f'Modes        : {MODES}')
     print(f'Dims         : {DIMS}')
@@ -192,35 +226,37 @@ def main():
     summary_rows = []
     t_all = time.time()
 
-    for i, (dataset, student) in enumerate(jobs, 1):
+    for i, (dataset, student, ablation) in enumerate(jobs, 1):
         epochs = EPOCHS_DEFAULT
-        out    = out_folder(dataset, student, epochs)
+        out    = out_folder(dataset, student, epochs, ablation)
         state  = run_state(out)
         script = DATASETS[dataset][0]
         resume = (state == 'resume')
-        cmd    = build_command(dataset, student, epochs, out, resume=resume)
+        cmd    = build_command(dataset, student, epochs, out, resume=resume, ablation=ablation)
 
         print()
         print_separator()
         print(f'[{i}/{len(jobs)}]  Script  : {script}')
         print(f'         Dataset : {dataset}')
         print(f'         Student : {student}')
+        print(f'         Ablation: {ablation}')
         print(f'         Epochs  : {epochs}')
         print(f'         Output  : {out}')
         print(f'         Status  : {state}')
         print(f"         Command : {' '.join(str(c) for c in cmd)}")
-        print_separator(flush=True) if False else print('=' * 78, flush=True)
+        print('=' * 78, flush=True)
 
         base_row = {
             'dataset': dataset,
             'student': student,
+            'ablation': ablation,
             'epochs':  epochs,
             'script':  script,
             'folder':  str(out),
         }
 
         if state == 'done' and SKIP_FINISHED:
-            print(f'  -> Skipping: already finished.')
+            print('  -> Skipping: already finished.')
             summary_rows.append({**base_row, 'status': 'skipped (finished)', 'minutes': 0})
             continue
 
@@ -253,7 +289,7 @@ def main():
         dw = max(len(r['dataset']) for r in summary_rows)
         sw = max(len(r['student']) for r in summary_rows)
         for r in summary_rows:
-            print(f"  {r['dataset']:<{dw}}  {r['student']:<{sw}}  "
+            print(f"  {r['dataset']:<{dw}}  {r['student']:<{sw}}  {r['ablation']:<13}  "
                   f"e{r['epochs']:<4}  {r['status']:<25}  {r['minutes']:>7.1f} min")
 
     total_min = (time.time() - t_all) / 60
@@ -263,7 +299,7 @@ def main():
 
     # Save summary CSV
     summary_csv = Path(RESULTS_ROOT) / 'runs_summary.csv'
-    fieldnames  = ['dataset', 'student', 'epochs', 'script', 'folder', 'status', 'minutes']
+    fieldnames  = ['dataset', 'student', 'ablation', 'epochs', 'script', 'folder', 'status', 'minutes']
     with open(summary_csv, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
