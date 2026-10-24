@@ -37,21 +37,21 @@ DATASETS = {
 #          efficientnet_b0, convnext_tiny
 STUDENTS = [
     'resnet18',
-    'mobilenet_v2',
+    # 'mobilenet_v2',
 
-    'mobilenet_v3_large',
-    'efficientnet_b0',
+    # 'mobilenet_v3_large',
+    # 'efficientnet_b0',
     
-    'convnext_tiny',
-    'resnet50',
+    # 'convnext_tiny',
+    # 'resnet50',
 ]
 
 # ── Core training settings ────────────────────────────────────────────────────
 # Fix 2: 50 epochs for convergence (v8 convergence check fires at 20)
-EPOCHS_DEFAULT = 50
+EPOCHS_DEFAULT = 20
 
 # Fix 4: 3 seeds for variance analysis (single seed gives NaN std)
-SEEDS = '42,43,44'
+SEEDS = '42' # 42,43,44
 
 # Fix 1: all 6 distillation modes including rkd, crd, dkd
 MODES = 'labels,feat,rkd,crd,dkd,vl2lite'

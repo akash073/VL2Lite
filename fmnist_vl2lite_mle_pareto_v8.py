@@ -20,6 +20,37 @@ v8 additions to v7
   B5  parse_dims now accepts tokens 'pca' and 'erank' in --dims.
   B6  All five selection strategies are reported in selection.json per mode.
   B7  pca_d and erank_d saved to dimension_estimates.json.
+  V1  Validation split (--val-fraction, default 0.1, stratified, fixed by --data-seed).
+      Oracle, d_eps, knee and every strategy comparison use validation accuracy;
+      test accuracy is reported only at the selected widths.
+  K1  RKD angle loss keeps only triplets with i, j, k pairwise distinct.
+  M1  Multi-GPU dispatch polls with a timeout, detects dead or stalled workers,
+      and writes lost_runs.json instead of hanging.
+  T1  Test isolation: train_one never sees the test set. After selection on
+      validation, only the selected models are loaded and scored on test once
+      (--test-scope all adds every candidate, for exploratory plots only).
+  P1  PCA and effective rank use the same L2-normalised space as the MLE;
+      raw-feature values are saved as an ablation.
+  G1  True no-bottleneck baseline (bottleneck_kind='identity') alongside the
+      full-width Linear projection; --no-identity-baseline skips it.
+  P6  failed_runs.json (exceptions) separate from lost_runs.json (crashed workers);
+      single-GPU runs record failures instead of aborting; hardware.json documents
+      the latency/energy measurement.
+  D1  Default grid starts at 2: 2,4,8,12,16,24,32,48,64,96,128 plus estimator widths.
+  A1  Matched-view ablation: --no-augment (teacher and student both see the
+      un-augmented image).
+  F1  VL2Lite-style uses the distance-only relational term (weight 1, no angle);
+      the full RKD weights (distance 25, angle 50) apply to mode 'rkd' only.
+  F2  Run signature includes a fingerprint of the training code, so --resume
+      refuses to mix runs trained under different loss definitions.
+  F3  Latency/energy measured once per architecture (width, kind) and shared
+      by every mode and seed with that architecture.
+  F4  Incomplete grids stop before analysis unless --allow-partial is given;
+      then widths without all seeds are excluded and selection.json says so.
+  F5  Training loader uses drop_last, so every batch has the same size.
+  Known, not changed in code: modes weight the classification loss differently
+      (labels/feat: 1; rkd/crd/dkd/vl2lite: annealed lam_cls 0.5 -> 0.8). Report it
+      or run a sensitivity check. DKD uses beta=1 and no warm-up (tune on validation).
   S1  New CLI args: --crd-temperature, --dkd-alpha, --dkd-beta,
       --pca-variance-threshold. All added to SIGNATURE_FIELDS.
 
@@ -83,9 +114,6 @@ AUG_HFLIP = True
 BACKBONE_DIM = {'resnet18': 512, 'resnet50': 2048, 'mobilenet_v2': 1280,
                 'mobilenet_v3_large': 960, 'efficientnet_b0': 1280, 'convnext_tiny': 768}
 
-# Standard fixed widths for the fixed-width baseline (B3)
-FIXED_WIDTH_GRID = [8, 16, 32, 64, 128, 256, 512]
-
 # All valid distillation modes
 VALID_MODES = {'labels', 'feat', 'rkd', 'crd', 'dkd', 'vl2lite'}
 
@@ -123,9 +151,10 @@ SIGNATURE_FIELDS = ['teacher', 'pretrained', 'student', 'no_pretrained_student',
                     'batch_size', 'lr', 'head_lr_mult', 'temperature', 'lam_cls_start', 'lam_cls_end',
                     'kd_logit_scale', 'w_mse', 'w_cos', 'w_consistency',
                     'id_samples', 'id_ks', 'optimizer', 'weight_decay',
-                    'label_smoothing', 'no_augment', 'full_identity',
+                    'label_smoothing', 'no_augment',
                     # S1: new fields
-                    'crd_temperature', 'dkd_alpha', 'dkd_beta', 'pca_variance_threshold']
+                    'crd_temperature', 'dkd_alpha', 'dkd_beta', 'pca_variance_threshold',
+                    'val_fraction']
 
 
 def seed_everything(s: int) -> None:
@@ -142,6 +171,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--max-train', type=int, default=0)
     p.add_argument('--max-test', type=int, default=0)
     p.add_argument('--data-seed', type=int, default=42)
+    p.add_argument('--val-fraction', type=float, default=0.1,
+                   help='V1: stratified fraction of the training set held out for '
+                        'bottleneck selection (oracle, d_eps, knee). The test set is '
+                        'only used to report accuracy at the selected widths.')
     p.add_argument('--teacher', default='ViT-B-32')
     p.add_argument('--pretrained', default='laion2b_s34b_b79k')
     p.add_argument('--student', choices=list(BACKBONE_DIM), default='resnet18')
@@ -149,7 +182,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--id-samples', type=int, default=5000)
     p.add_argument('--id-ks', type=int, nargs='+', default=[5, 10, 20, 50])
     p.add_argument('--id-repeats', type=int, default=5)
-    p.add_argument('--dims', default='8,mle*0.5,mle*0.75,mle,pca,erank,mle*1.25,mle*1.5,32,128,full',
+    p.add_argument('--dims', default='2,4,8,12,16,24,32,48,64,96,128,'
+                                     'mle*0.5,mle*0.75,mle,pca,erank,mle*1.25,mle*1.5,full',
                    help="Tokens: integer, 'mle', 'mle*<factor>', 'pca', 'erank', 'full'.")
     p.add_argument('--modes', default='labels,feat,rkd,crd,dkd,vl2lite',
                    help=f'Comma-separated subset of: {sorted(VALID_MODES)}')
@@ -163,12 +197,28 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--label-smoothing', type=float, default=0.1)
     p.add_argument('--no-augment', action='store_true')
-    p.add_argument('--full-identity', action='store_true')
+    p.add_argument('--no-identity-baseline', action='store_true',
+                   help='G1: skip the true no-bottleneck baseline (backbone -> classifier, '
+                        'no projection layer). By default it is trained for every mode and seed '
+                        "alongside the 'full' width, which has a full-width Linear projection.")
+    p.add_argument('--test-scope', choices=['selected', 'all'], default='selected',
+                   help="T1: 'selected' (default) evaluates the test set only for models chosen "
+                        "by a selection strategy, after selection. 'all' also scores every "
+                        'candidate on test, for exploratory plots only.')
     p.add_argument('--head-lr-mult', type=float, default=10.0)
     p.add_argument('--seeds', default='42,43,44')
     p.add_argument('--num-workers', type=int, default=0)
     p.add_argument('--gpus', default='0')
     p.add_argument('--resume', action='store_true')
+    p.add_argument('--allow-partial', action='store_true',
+                   help='F4: analyse an incomplete grid instead of stopping. Widths with fewer '
+                        'than the requested seeds are excluded from selection, and '
+                        'selection.json is marked "complete": false.')
+    p.add_argument('--worker-poll-seconds', type=float, default=30.0,
+                   help='M1: how often the parent checks that GPU workers are still alive')
+    p.add_argument('--worker-stall-hours', type=float, default=0.0,
+                   help='M1: terminate a live worker that sends nothing for this long '
+                        '(0 disables; set above the longest single run)')
     # VL2Lite-style
     p.add_argument('--temperature', type=float, default=2.0)
     p.add_argument('--lam-cls-start', type=float, default=0.50)
@@ -223,6 +273,21 @@ def balanced_indices(targets, maximum: int, seed: int) -> np.ndarray:
         take = maximum // n_cls + (1 if c < maximum % n_cls else 0)
         out.extend(rng.choice(np.flatnonzero(targets == c), size=take, replace=False).tolist())
     return np.array(sorted(out), dtype=np.int64)
+
+
+def stratified_split(indices, labels, val_fraction, seed):
+    """V1: split indices into (fit, val), stratified by class, reproducible via seed."""
+    indices, labels = np.asarray(indices), np.asarray(labels)
+    rng = np.random.default_rng(seed + 7919)
+    fit, val = [], []
+    for c in np.unique(labels):
+        members = indices[labels == c]
+        members = members[rng.permutation(len(members))]
+        n_val = max(1, int(round(val_fraction * len(members))))
+        if n_val >= len(members):
+            raise ValueError(f'Class {c} has {len(members)} samples; cannot hold out {n_val}.')
+        val.extend(members[:n_val].tolist()); fit.extend(members[n_val:].tolist())
+    return np.array(sorted(fit), dtype=np.int64), np.array(sorted(val), dtype=np.int64)
 
 
 def student_transform(train=False, augment=True):
@@ -284,36 +349,40 @@ def mle_stability(embeddings, ks, n, seed, repeats):
             'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
 
 
-def pca_dimension(embeddings, variance_threshold=0.95) -> int:
+def _centered(embeddings, normalize=True):
+    """P1: same feature space as the MLE (L2-normalised CLIP embeddings), then centred.
+    normalize=False reproduces the raw-feature estimates as an ablation."""
+    x = embeddings.float().numpy().astype('float64')
+    if normalize:
+        x = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
+    return x - x.mean(axis=0)
+
+
+def pca_dimension(embeddings, variance_threshold=0.95, normalize=True) -> int:
     """B1: smallest number of PCs explaining variance_threshold of total variance.
     Reference: Jolliffe (2002), Principal Component Analysis, 2nd ed., Springer."""
-    x = embeddings.float().numpy().astype('float64')
-    x -= x.mean(axis=0)
-    _, s, _ = np.linalg.svd(x, full_matrices=False)
+    s = np.linalg.svd(_centered(embeddings, normalize), compute_uv=False)
     explained = np.cumsum(s ** 2) / (s ** 2).sum()
-    d = int(np.searchsorted(explained, variance_threshold) + 1)
-    return max(2, d)
+    return max(2, int(np.searchsorted(explained, variance_threshold) + 1))
 
 
-def effective_rank_dimension(embeddings) -> int:
+def effective_rank_dimension(embeddings, normalize=True) -> int:
     """B2: exp(Shannon entropy of normalised singular values).
     Reference: Roy & Vetterli (2007), EUSIPCO, pp. 606-610."""
-    x = embeddings.float().numpy().astype('float64')
-    x -= x.mean(axis=0)
-    _, s, _ = np.linalg.svd(x, full_matrices=False)
+    s = np.linalg.svd(_centered(embeddings, normalize), compute_uv=False)
     s = s[s > 1e-10]
     p = s / s.sum()
-    erank = int(round(float(np.exp(-np.sum(p * np.log(p))))))
-    return max(2, erank)
+    return max(2, int(round(float(np.exp(-np.sum(p * np.log(p)))))))
 
 
-def fixed_width_nearest(mle_d: int, full_d: int) -> int:
-    """B3: nearest standard power-of-two width to mle_d.
+# B3: fixed widths are independent of MLE — do not use mle_d to select them.
+FIXED_WIDTHS_INDEPENDENT = [16, 32, 64]
+
+
+def fixed_widths_for(full_d: int) -> list:
+    """B3: return fixed widths that are <= full_d and independent of MLE.
     Reference: Romero et al., ICLR 2015 (FitNets)."""
-    candidates = [w for w in FIXED_WIDTH_GRID if w <= full_d]
-    if not candidates:
-        return 8
-    return min(candidates, key=lambda w: abs(w - mle_d))
+    return [w for w in FIXED_WIDTHS_INDEPENDENT if w <= full_d]
 
 
 # ── Teacher cache ─────────────────────────────────────────────────────────────
@@ -414,11 +483,22 @@ def zero_shot_accuracy(feats, text, labels):
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
+def run_tag(mode, d, seed, kind='linear'):
+    """G1: identity (no-bottleneck) runs get an 'id' suffix so they never collide
+    with the full-width Linear projection at the same d."""
+    return f"{mode}_d{d}{'id' if kind == 'identity' else ''}_seed{seed}"
+
+
 class StudentMLE(nn.Module):
-    def __init__(self, name, n_classes, d_b, pretrained=True, full_identity=False):
+    """kind='linear':   backbone -> Linear(backbone_dim, d_b) -> classifier
+       kind='identity': backbone -> classifier (true no-bottleneck baseline, d_b = backbone_dim)"""
+    def __init__(self, name, n_classes, d_b, pretrained=True, kind='linear'):
         super().__init__()
         self.backbone = build_backbone(name, pretrained)
-        self.has_bottleneck_layer = d_b != BACKBONE_DIM[name] or not full_identity
+        if kind == 'identity' and d_b != BACKBONE_DIM[name]:
+            raise ValueError(f'identity baseline needs d_b == {BACKBONE_DIM[name]}, got {d_b}')
+        self.kind = kind
+        self.has_bottleneck_layer = kind != 'identity'
         self.bottleneck = (nn.Linear(BACKBONE_DIM[name], d_b) if self.has_bottleneck_layer
                            else nn.Identity())
         self.classifier = nn.Linear(d_b, n_classes)
@@ -454,22 +534,60 @@ class Condense(nn.Module):
 
 
 # ── Losses ────────────────────────────────────────────────────────────────────
-def relational_kd(z, t_img):
-    """D1/RKD: mean-normalised pairwise distance matching.
-    Reference: Park et al., CVPR 2019."""
+def relational_kd(z, t_img, w_dist=25.0, w_angle=50.0):
+    """D1/RKD: distance + angle relational losses.
+    Reference: Park et al., CVPR 2019 (Eq. 3 + Eq. 4)."""
     zs = F.normalize(z.float(), dim=-1)
     ts = F.normalize(t_img.float(), dim=-1)
-    off = ~torch.eye(zs.shape[0], dtype=torch.bool, device=zs.device)
-    d_s, d_t = torch.cdist(zs, zs), torch.cdist(ts, ts)
+    N = zs.shape[0]
+    # No pairwise relationships exist for a singleton minibatch.
+    # Return a differentiable zero so backpropagation remains valid.
+    if N < 2:
+        return z.float().sum() * 0.0
+    off = ~torch.eye(N, dtype=torch.bool, device=zs.device)
+
+    # Distance loss (Eq. 3)
+    d_s = torch.cdist(zs, zs)
+    d_t = torch.cdist(ts, ts)
     d_s = d_s / d_s[off].mean().clamp_min(1e-6)
     d_t = d_t / d_t[off].mean().clamp_min(1e-6)
-    return F.smooth_l1_loss(d_s[off], d_t[off])
+    loss_dist = F.smooth_l1_loss(d_s[off], d_t[off])
+
+    # Angle loss (Eq. 4) — triplet cosine angle matching
+    # For each anchor i, compute cosine of angle at i for all pairs (j, k)
+    # Using the identity: cos(angle_ijk) = (e_ij . e_ik) where e = unit diff vector
+    if N >= 3 and w_angle > 0:      # skip the N x N x N tensor when the angle term is off
+        # student and teacher difference vectors: (N, N, D)
+        zs_e = zs.unsqueeze(1) - zs.unsqueeze(0)   # (N, N, D)
+        ts_e = ts.unsqueeze(1) - ts.unsqueeze(0)
+        zs_e = F.normalize(zs_e, dim=-1, eps=1e-8)
+        ts_e = F.normalize(ts_e, dim=-1, eps=1e-8)
+        # Pairwise angle similarity via bmm: (N,N,N) — memory-efficient
+        # angle_s[i,j,k] = dot(e_ij, e_ik) — no N³D intermediate tensor
+        angle_s = torch.bmm(zs_e, zs_e.transpose(1, 2))  # (N, N, N)
+        angle_t = torch.bmm(ts_e, ts_e.transpose(1, 2))
+        # angle_s[i, j, k] is the angle at anchor i between rays i->j and i->k.
+        # Keep only proper triplets with i, j, k pairwise distinct: if j == i or
+        # k == i the ray e_ii is a zero vector (cosine 0 for both nets), and
+        # j == k gives cosine 1 for both. Those terms carry no information and
+        # only dilute the mean.
+        ne = ~torch.eye(N, dtype=torch.bool, device=zs.device)
+        mask3 = ne.unsqueeze(2) & ne.unsqueeze(1) & ne.unsqueeze(0)  # i!=j, i!=k, j!=k
+        loss_angle = F.smooth_l1_loss(angle_s[mask3], angle_t[mask3])
+    else:
+        loss_angle = torch.tensor(0.0, device=zs.device)
+
+    return w_dist * loss_dist + w_angle * loss_angle
 
 
-def crd_loss(z, t_img, temperature=0.07):
-    """D2/CRD: symmetric contrastive loss between student and teacher embeddings.
+def crd_loss(z_proj, t_img, temperature=0.07):
+    """D2/CRD-style: symmetric contrastive loss.
+    z_proj must already be projected to vlm_dim (same dim as t_img).
     Reference: Tian et al., ICLR 2020."""
-    z_n = F.normalize(z.float(), dim=-1)
+    assert z_proj.shape[-1] == t_img.shape[-1], (
+        f'CRD dim mismatch: z_proj {z_proj.shape} vs t_img {t_img.shape}. '
+        'Pass crd_align(z) not z.')
+    z_n = F.normalize(z_proj.float(), dim=-1)
     t_n = F.normalize(t_img.float(), dim=-1)
     N = z_n.shape[0]
     logits = z_n @ t_n.T / temperature          # (N, N)
@@ -479,15 +597,13 @@ def crd_loss(z, t_img, temperature=0.07):
     return (loss_s2t + loss_t2s) / 2.0
 
 
-def dkd_loss(logits, t_img, t_txt, temperature=4.0, alpha=1.0, beta=1.0):
+def dkd_loss(student_logits, teacher_logits, targets, temperature=4.0, alpha=1.0, beta=1.0):
     """D3/DKD: decoupled KD separating TCKD (target class) and NCKD (non-target).
+    Uses ground-truth targets (not teacher argmax) and properly scaled teacher logits.
     Reference: Zhao et al., CVPR 2022."""
-    # Teacher soft labels from image-text similarity
-    t_soft = F.softmax(
-        (F.normalize(t_img.float(), dim=-1) @ F.normalize(t_txt.float(), dim=-1).T) / temperature,
-        dim=1)
-    s_soft = F.softmax(logits / temperature, dim=1)
-    gt = t_soft.argmax(dim=1)
+    s_soft = F.softmax(student_logits / temperature, dim=1)
+    t_soft = F.softmax(teacher_logits / temperature, dim=1)   # already scaled
+    gt = targets.long()                                        # ground-truth labels
 
     # TCKD: binary distribution over correct class vs. rest
     s_t = s_soft.gather(1, gt.unsqueeze(1))
@@ -499,12 +615,12 @@ def dkd_loss(logits, t_img, t_txt, temperature=4.0, alpha=1.0, beta=1.0):
     mask.scatter_(1, gt.unsqueeze(1), False)
     s_nt = s_soft[mask].view(s_soft.shape[0], -1)
     t_nt = t_soft[mask].view(t_soft.shape[0], -1)
-    # Renormalise to sum to 1 over non-target classes
     s_nt = s_nt / s_nt.sum(dim=1, keepdim=True).clamp_min(1e-7)
     t_nt = t_nt / t_nt.sum(dim=1, keepdim=True).clamp_min(1e-7)
     nckd = F.kl_div(s_nt.log().clamp_min(-100), t_nt, reduction='batchmean')
 
-    return alpha * tckd + beta * nckd
+    # T² scaling aligns with original DKD formulation (Zhao et al., CVPR 2022)
+    return (temperature ** 2) * (alpha * tckd + beta * nckd)
 
 
 def linguistic_kd(z, t_img, t_txt, cond_text, logit_scale, temp):
@@ -598,25 +714,78 @@ def bench_trial_rows(tag, bench):
             for i, lt in enumerate(bench['latency_trials'])]
 
 
-def benchmark_saved(results, out, device, a):
-    rows = []
-    for r in results:
-        obj = torch.load(out / f"{r['tag']}.pt", map_location='cpu', weights_only=True)
-        dep = Deployable(StudentMLE(a.student, NUM_CLASSES, int(r['bottleneck_d']), pretrained=False,
-                                    full_identity=a.full_identity))
-        dep.load_state_dict(obj['student_deployed'])
-        b = benchmark(dep.to(device), device, a)
-        r.update({k: b[k] for k in BENCH_KEYS})
-        rows += bench_trial_rows(r['tag'], b)
-        print(f"  benchmarked {r['tag']}: {b['latency_ms']:.3f} ms, {b['energy_mJ']:.1f} mJ", flush=True)
+def load_deployable(r, out, a):
+    obj = torch.load(out / f"{r['tag']}.pt", map_location='cpu', weights_only=True)
+    dep = Deployable(StudentMLE(a.student, NUM_CLASSES, int(r['bottleneck_d']), pretrained=False,
+                                kind=r.get('bottleneck_kind', 'linear')))
+    dep.load_state_dict(obj['student_deployed'])
+    return dep
+
+
+def evaluate_saved_on_test(rows, out, ds_test, device, a):
+    """T1: score saved models on the held-out test set. Called only after selection."""
+    loader = DataLoader(ds_test, batch_size=a.batch_size, shuffle=False,
+                        num_workers=min(a.num_workers, 2), persistent_workers=False)
+    scored = {}
+    for r in rows:
+        dep = load_deployable(r, out, a).to(device)
+        scored[r['tag']] = evaluate(dep, loader, device)
+        print(f"  test {r['tag']}: {scored[r['tag']]['accuracy_pct']:.2f}%", flush=True)
         del dep
         if device.type == 'cuda':
             torch.cuda.empty_cache()
+    return scored
+
+
+def hardware_info(device, a):
+    """P6: what the latency/energy numbers were measured on, and how."""
+    info = {'device': str(device), 'torch': torch.__version__,
+            'cuda_runtime': torch.version.cuda, 'benchmark_batch_size': 1,
+            'input_shape': [1, 3, 224, 224], 'repeats_per_trial': a.benchmark_repeats,
+            'trials': a.benchmark_trials, 'warmup_iterations': 30,
+            'latency_method': 'wall clock around repeats_per_trial forward passes with '
+                              'torch.cuda.synchronize; median and IQR over trials',
+            'energy_method': 'NVML nvmlDeviceGetTotalEnergyConsumption delta over each trial '
+                             'window divided by repeats; includes idle/background GPU power, so '
+                             'compare models measured on the same idle GPU only; median and IQR '
+                             'over trials; NaN where the counter is unsupported'}
+    if device.type == 'cuda':
+        info['gpu_name'] = torch.cuda.get_device_name(device)
+        try:
+            import pynvml
+            pynvml.nvmlInit()
+            drv = pynvml.nvmlSystemGetDriverVersion()
+            info['driver'] = drv.decode() if isinstance(drv, bytes) else drv
+        except Exception:
+            info['driver'] = 'unknown (pynvml unavailable)'
+    return info
+
+
+def benchmark_saved(results, out, device, a):
+    """F3: the deployed network (backbone -> bottleneck -> classifier) depends only on
+    (width, bottleneck kind); KD heads are discarded. Benchmark one checkpoint per
+    architecture and copy the numbers to every run with that architecture. This is
+    ~18x faster and keeps timing noise out of Pareto comparisons between modes."""
+    rows, by_arch = [], {}
+    for r in results:
+        key = (int(r['bottleneck_d']), r.get('bottleneck_kind', 'linear'))
+        if key not in by_arch:
+            dep = load_deployable(r, out, a)
+            b = by_arch[key] = benchmark(dep.to(device), device, a)
+            rows += bench_trial_rows(f'arch_d{key[0]}_{key[1]}', b)
+            print(f"  benchmarked d={key[0]} ({key[1]}): {b['latency_ms']:.3f} ms, "
+                  f"{b['energy_mJ']:.1f} mJ", flush=True)
+            del dep
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+        r.update({k: by_arch[key][k] for k in BENCH_KEYS})
+    print(f'  {len(by_arch)} architecture(s) benchmarked for {len(results)} run(s)', flush=True)
     return rows
 
 
 # ── Pareto / analysis ─────────────────────────────────────────────────────────
-def pareto_mask(frame, acc_col='test_accuracy_pct'):
+def pareto_mask(frame, acc_col='val_accuracy_pct'):
+    """Nondominance on (validation accuracy, energy, latency) within the evaluated set."""
     vals = frame[[acc_col, 'energy_mJ', 'latency_ms']].to_numpy(float)
     valid = np.isfinite(vals).all(axis=1)
     obj = np.column_stack([-vals[:, 0], vals[:, 1], vals[:, 2]])
@@ -629,7 +798,8 @@ def pareto_mask(frame, acc_col='test_accuracy_pct'):
 
 
 def pareto_freq_per_seed(frame):
-    keys = {(str(r['mode']), int(r['bottleneck_d'])) for _, r in frame.iterrows()}
+    keys = {(str(r['mode']), str(r['bottleneck_kind']), int(r['bottleneck_d']))
+            for _, r in frame.iterrows()}
     freq = {k: 0 for k in keys}
     seeds = frame['seed'].unique()
     for s in seeds:
@@ -637,14 +807,18 @@ def pareto_freq_per_seed(frame):
         mask = pareto_mask(sub)
         for i, r in sub.iterrows():
             if mask[i] == 'nondominated_within_evaluated_set':
-                freq[(str(r['mode']), int(r['bottleneck_d']))] += 1
+                freq[(str(r['mode']), str(r['bottleneck_kind']), int(r['bottleneck_d']))] += 1
     return {k: round(v / len(seeds), 3) for k, v in freq.items()}
 
 
-def knee_analysis(sub, knee_gain):
+SELECT_COL = 'val_accuracy_pct'     # V1: every selection decision uses validation accuracy
+REPORT_COL = 'test_accuracy_pct'    # test accuracy is only reported at the selected widths
+
+
+def knee_analysis(sub, knee_gain, col=SELECT_COL):
     s = sub.sort_values('bottleneck_d')
     d = s['bottleneck_d'].to_numpy(float)
-    acc = s['test_accuracy_pct'].to_numpy(float)
+    acc = s[col].to_numpy(float)
     gains = [{'from_d': int(d[i]), 'to_d': int(d[i + 1]),
               'gain_pp_per_doubling': round(float((acc[i + 1] - acc[i]) / math.log2(d[i + 1] / d[i])), 3)}
              for i in range(len(d) - 1)]
@@ -656,21 +830,35 @@ def knee_analysis(sub, knee_gain):
     return gains, knee
 
 
-def d_eps_at(sub, tol):
-    best = sub['test_accuracy_pct'].max()
-    return int(sub[sub['test_accuracy_pct'] >= best - tol]['bottleneck_d'].min())
+def d_eps_at(sub, tol, col=SELECT_COL):
+    """Smallest d whose accuracy (default: validation) is within tol pp of the best."""
+    best = sub[col].max()
+    return int(sub[sub[col] >= best - tol]['bottleneck_d'].min())
 
 
-def _acc_at(sub, d):
-    """Accuracy at a given d, or nan if d not in grid."""
+def _acc_at(sub, d, col=SELECT_COL):
+    """Accuracy in column col at a given d, or nan if d is not in the grid."""
     row = sub[sub['bottleneck_d'] == d]
-    return float(row['test_accuracy_pct'].iloc[0]) if not row.empty else float('nan')
+    return float(row[col].iloc[0]) if not row.empty else float('nan')
+
+
+def _at(sub, d):
+    """Validation and test accuracy at width d (selection uses val, test is reported)."""
+    return {'d': int(d), 'val_accuracy_pct': _acc_at(sub, d, SELECT_COL),
+            'test_accuracy_pct': _acc_at(sub, d, REPORT_COL)}
 
 
 # ── Dimension parsing ──────────────────────────────────────────────────────────
-def parse_dims(spec, mle_d, pca_d, erank_d, full_d):
-    """B5: parse --dims tokens including 'pca' and 'erank'."""
+def parse_dims(spec, mle_d, pca_d, erank_d, full_d, fixed_widths=None):
+    """B5: parse --dims tokens including 'pca' and 'erank'.
+    Always injects fixed_widths into the grid so _acc_at never returns NaN
+    for the independent fixed-width baselines."""
     dims = []
+    # Always include independent fixed widths in the grid
+    for fw in (fixed_widths or []):
+        fw = max(2, min(full_d, fw))
+        if fw not in dims:
+            dims.append(fw)
     for tok in spec.split(','):
         tok = tok.strip().lower()
         if tok == 'mle':
@@ -703,15 +891,16 @@ def check_resume_signature(out, a, run_signature):
 
 
 # ── Training ───────────────────────────────────────────────────────────────────
-def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
+def train_one(mode, d_b, seed, kind, teacher_feats, teacher_txt, ds_train, ds_val,
               vlm_dim, device, a):
+    """T1: trains and scores on validation only. The test set is never touched here."""
     seed_everything(seed)
-    tag = f'{mode}_d{d_b}_seed{seed}'
+    tag = run_tag(mode, d_b, seed, kind)
     student = StudentMLE(a.student, NUM_CLASSES, d_b,
-                         pretrained=not a.no_pretrained_student,
-                         full_identity=a.full_identity).to(device)
+                         pretrained=not a.no_pretrained_student, kind=kind).to(device)
     cond_text = Condense(vlm_dim, d_b).to(device)   # vl2lite only
     align = nn.Linear(d_b, vlm_dim).to(device)       # feat only
+    crd_align = nn.Linear(d_b, vlm_dim).to(device)   # crd only: projects to teacher dim
 
     backbone_params = list(student.backbone.parameters())
     head_params = list(student.bottleneck.parameters()) + list(student.classifier.parameters())
@@ -719,6 +908,8 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
         head_params += list(cond_text.parameters())
     elif mode == 'feat':
         head_params += list(align.parameters())
+    elif mode == 'crd':
+        head_params += list(crd_align.parameters())
     params = backbone_params + head_params
 
     groups = [{'params': backbone_params, 'lr': a.lr},
@@ -730,13 +921,18 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda e: 0.01 + 0.99 * 0.5 * (1 + math.cos(math.pi * e / a.epochs)))
 
+    # F5: every training batch has the same size, so batch-dependent losses (RKD pairs,
+    # CRD negatives) see a constant number of samples. Disabled only if the training
+    # set is smaller than one batch.
     train_loader = DataLoader(ds_train, batch_size=a.batch_size, shuffle=True,
                               num_workers=a.num_workers, pin_memory=device.type == 'cuda',
-                              persistent_workers=a.num_workers > 0)
-    test_loader = DataLoader(ds_test, batch_size=a.batch_size, shuffle=False,
-                             num_workers=min(a.num_workers, 2), persistent_workers=False)
+                              persistent_workers=a.num_workers > 0,
+                              drop_last=len(ds_train) > a.batch_size)
+    val_loader = DataLoader(ds_val, batch_size=a.batch_size, shuffle=False,
+                            num_workers=min(a.num_workers, 2), persistent_workers=False)
+    val = None
     t_txt = teacher_txt.to(device)
-    curves, test, t_start = [], None, time.perf_counter()
+    curves, t_start = [], time.perf_counter()
 
     for epoch in range(a.epochs):
         student.train(); cond_text.train(); align.train()
@@ -744,6 +940,7 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
         lam_cls = a.lam_cls_start + (a.lam_cls_end - a.lam_cls_start) * frac
         lam_kd = (1.0 - lam_cls) / 2.0
         sums = dict(loss=0.0, cls=0.0, kd1=0.0, kd2=0.0)
+        seen = 0
 
         for xs, ys, ix in train_loader:
             xs, ys = xs.to(device), ys.to(device)
@@ -767,14 +964,21 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
                 k1, k2 = l_rkd.item(), 0.0
 
             elif mode == 'crd':
-                # D2: contrastive student-teacher matching
-                l_crd = crd_loss(z, t_img, temperature=a.crd_temperature)
+                # D2: project student to teacher dim first (fixes shape mismatch)
+                z_proj = crd_align(z)
+                l_crd = crd_loss(z_proj, t_img, temperature=a.crd_temperature)
                 loss = lam_cls * l_cls + (1.0 - lam_cls) * l_crd
                 k1, k2 = l_crd.item(), 0.0
 
             elif mode == 'dkd':
-                # D3: decoupled KD (TCKD + NCKD)
-                l_dkd = dkd_loss(logits, t_img, t_txt,
+                # D3: decoupled KD — use scaled teacher logits + ground-truth targets
+                teacher_logits = (
+                    a.kd_logit_scale_used
+                    * (F.normalize(t_img.float(), dim=-1)
+                       @ F.normalize(t_txt.float(), dim=-1).T))
+                l_dkd = dkd_loss(student_logits=logits,
+                                 teacher_logits=teacher_logits,
+                                 targets=ys,
                                  temperature=a.temperature,
                                  alpha=a.dkd_alpha,
                                  beta=a.dkd_beta)
@@ -782,7 +986,9 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
                 k1, k2 = l_dkd.item(), 0.0
 
             else:  # vl2lite
-                l_vis = relational_kd(z, t_img)
+                # F1: VL2Lite-style keeps its original distance-only relational term
+                # (weight 1, no angle). The full RKD weights (25 / 50) belong to mode 'rkd'.
+                l_vis = relational_kd(z, t_img, w_dist=1.0, w_angle=0.0)
                 l_txt = linguistic_kd(z, t_img, t_txt, cond_text, a.kd_logit_scale_used, a.temperature)
                 loss = lam_cls * l_cls + lam_kd * l_vis + lam_kd * l_txt
                 k1, k2 = l_vis.item(), l_txt.item()
@@ -795,37 +1001,40 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
             nn.utils.clip_grad_norm_(params, max_norm=1.0)
             opt.step()
             bs = xs.size(0)
+            seen += bs
             sums['loss'] += loss.item() * bs; sums['cls'] += l_cls.item() * bs
             sums['kd1'] += k1 * bs; sums['kd2'] += k2 * bs
 
         sched.step()
-        n = len(ds_train)
+        n = max(seen, 1)
         evaluated = epoch == a.epochs - 1 or (a.eval_every > 0 and (epoch + 1) % a.eval_every == 0)
         if evaluated:
-            test = evaluate(student, test_loader, device)
-        curves.append({'tag': tag, 'mode': mode, 'bottleneck_d': d_b, 'seed': seed,
+            val = evaluate(student, val_loader, device)
+        curves.append({'tag': tag, 'mode': mode, 'bottleneck_d': d_b, 'bottleneck_kind': kind,
+                       'seed': seed,
                        'epoch': epoch + 1, 'lam_cls': lam_cls if mode == 'vl2lite' else 1.0,
                        **{k: v / n for k, v in sums.items()},
-                       'test_accuracy_pct': test['accuracy_pct'] if evaluated else float('nan')})
-        acc_txt = f"{test['accuracy_pct']:.2f}" if evaluated else 'n/a'
+                       'val_accuracy_pct': val['accuracy_pct'] if evaluated else float('nan')})
+        acc_txt = f"val={val['accuracy_pct']:.2f}" if evaluated else 'n/a'
         print(f"[{tag}] ep{epoch + 1:02d}/{a.epochs} loss={sums['loss']/n:.4f} "
               f"cls={sums['cls']/n:.4f} kd1={sums['kd1']/n:.4f} kd2={sums['kd2']/n:.4f} "
-              f"test_acc={acc_txt}", flush=True)
+              f"acc {acc_txt}", flush=True)
 
     train_s = time.perf_counter() - t_start
     deployed = Deployable(student)
     out_dir = Path(a.out)
     bench = benchmark(deployed.to(device), device, a) if a.benchmark == 'inline' else None
     torch.save({'student_deployed': deployed.cpu().state_dict(), 'architecture': a.student,
-                'bottleneck_d': d_b, 'mode': mode, 'seed': seed}, out_dir / f'{tag}.pt')
+                'bottleneck_d': d_b, 'bottleneck_kind': kind, 'mode': mode, 'seed': seed},
+               out_dir / f'{tag}.pt')
     pd.DataFrame(curves).to_csv(out_dir / f'{tag}_history.csv', index=False)
     ce_last = curves[-1]['cls']
     ce_prev = curves[-2]['cls'] if len(curves) > 1 else float('nan')
     ce_drop = 100.0 * (ce_prev - ce_last) / ce_prev if ce_prev and np.isfinite(ce_prev) else float('nan')
-    res = {'tag': tag, 'mode': mode, 'seed': seed, 'bottleneck_d': d_b,
+    res = {'tag': tag, 'mode': mode, 'seed': seed, 'bottleneck_d': d_b, 'bottleneck_kind': kind,
            'final_train_ce': ce_last, 'last_epoch_ce_drop_pct': ce_drop,
            'has_bottleneck_layer': student.has_bottleneck_layer,
-           'test_accuracy_pct': test['accuracy_pct'], 'test_macro_f1_pct': test['macro_f1_pct'],
+           'val_accuracy_pct': val['accuracy_pct'], 'val_macro_f1_pct': val['macro_f1_pct'],
            'parameters': sum(p.numel() for p in deployed.parameters()), 'train_seconds': train_s,
            'run_signature': a.run_signature}
     res.update({k: (bench[k] if bench else float('nan')) for k in BENCH_KEYS})
@@ -833,20 +1042,106 @@ def train_one(mode, d_b, seed, teacher_feats, teacher_txt, ds_train, ds_test,
 
 
 def _worker(gpu_id, configs, shared, q):
-    device = torch.device(f'cuda:{gpu_id}')
-    torch.cuda.set_device(device)
-    a = shared['a']
-    train_base, test_base = load_fmnist(a.data_root, download=False)
-    ds_train = FMNISTView(train_base, shared['train_ids'],
-                          student_transform(train=True, augment=not a.no_augment))
-    ds_test = FMNISTView(test_base, shared['test_ids'], student_transform())
-    for mode, d, seed in configs:
+    """M1: every message carries gpu_id, and ('done', gpu_id) is always sent last."""
+    try:
+        device = torch.device(f'cuda:{gpu_id}')
+        torch.cuda.set_device(device)
+        a = shared['a']
+        train_base, _ = load_fmnist(a.data_root, download=False)
+        ds_train = FMNISTView(train_base, shared['train_ids'],
+                              student_transform(train=True, augment=not a.no_augment))
+        ds_val = FMNISTView(train_base, shared['val_ids'], student_transform())
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        for cfg in configs:
+            q.put(('err', gpu_id, run_tag(*cfg), f'worker setup failed:\n{tb}'))
+        q.put(('done', gpu_id))
+        return
+    for mode, d, seed, kind in configs:
         try:
-            q.put(('ok',) + train_one(mode, d, seed, shared['teacher_feats'], shared['teacher_txt'],
-                                      ds_train, ds_test, shared['vlm_dim'], device, a))
+            q.put(('ok', gpu_id) + train_one(mode, d, seed, kind, shared['teacher_feats'],
+                                             shared['teacher_txt'], ds_train, ds_val,
+                                             shared['vlm_dim'], device, a))
         except Exception:
             import traceback
-            q.put(('err', f'{mode}_d{d}_seed{seed}', traceback.format_exc()))
+            q.put(('err', gpu_id, run_tag(mode, d, seed, kind), traceback.format_exc()))
+    q.put(('done', gpu_id))
+
+
+def dispatch_workers(worker_fn, gpu_ids, buckets, shared, on_ok, poll_seconds=30.0,
+                     stall_seconds=0.0, ctx=None):
+    """M1: one worker process per GPU; never blocks forever.
+
+    Returns (lost, failed):
+      lost   - tags never reported (worker crashed, was killed, or stalled)
+      failed - {tag: traceback} for runs that raised an exception
+    Both are rerun by --resume, because neither has a saved result.
+    """
+    import queue as _queue
+    ctx = ctx or mp.get_context('spawn')
+    q = ctx.Queue()
+    procs = {g: ctx.Process(target=worker_fn, args=(g, b, shared, q))
+             for g, b in zip(gpu_ids, buckets)}
+    expected = {g: {run_tag(*c) for c in b} for g, b in zip(gpu_ids, buckets)}
+    reported = {g: set() for g in gpu_ids}
+    failed = {}
+    finished, last_seen = set(), {g: time.time() for g in gpu_ids}
+    total = sum(len(b) for b in buckets)
+    n_seen = 0
+    for p in procs.values():
+        p.start()
+
+    while len(finished) < len(procs):
+        try:
+            item = q.get(timeout=poll_seconds)
+        except _queue.Empty:
+            now = time.time()
+            for g, p in procs.items():
+                if g in finished:
+                    continue
+                if not p.is_alive():
+                    print(f'[ERROR] worker on GPU {g} exited (code {p.exitcode}) before '
+                          f'finishing; {len(expected[g] - reported[g])} run(s) lost.', flush=True)
+                    finished.add(g)
+                elif stall_seconds > 0 and now - last_seen[g] > stall_seconds:
+                    print(f'[ERROR] worker on GPU {g} silent for {(now - last_seen[g]) / 60:.0f} min; '
+                          'terminating it.', flush=True)
+                    p.terminate(); p.join(10)
+                    finished.add(g)
+            continue
+
+        kind, g = item[0], item[1]
+        last_seen[g] = time.time()
+        if kind == 'done':
+            finished.add(g)
+            continue
+        n_seen += 1
+        if kind == 'err':
+            reported[g].add(item[2])
+            failed[item[2]] = item[3]
+            print(f'[ERROR] {item[2]} ({n_seen}/{total})\n{item[3]}', flush=True)
+        else:
+            res = item[2]
+            reported[g].add(res['tag'])
+            on_ok(*item[2:])
+            print(f"  collected {n_seen}/{total}: {res['tag']}", flush=True)
+
+    for p in procs.values():
+        p.join(timeout=30)
+        if p.is_alive():
+            p.terminate(); p.join(10)
+    lost = sorted(t for g in gpu_ids for t in expected[g] - reported[g])
+    return lost, failed
+
+
+def code_fingerprint():
+    """F2: hash of everything that defines how a run is trained."""
+    import inspect
+    parts = (relational_kd, crd_loss, dkd_loss, linguistic_kd, feature_kd, flip_consistency,
+             StudentMLE, Condense, train_one, student_transform, stratified_split,
+             balanced_indices, build_backbone)
+    return hashlib.sha256(''.join(inspect.getsource(f) for f in parts).encode()).hexdigest()[:12]
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -859,13 +1154,19 @@ def run():
         raise ValueError(f'Unknown modes: {sorted(invalid_modes)}. Valid: {sorted(VALID_MODES)}')
     if not 0.0 <= a.label_smoothing < 1.0:
         raise ValueError('--label-smoothing must be in [0, 1)')
+    if not 0.0 < a.val_fraction < 0.5:
+        raise ValueError('--val-fraction must be in (0, 0.5)')
     if a.epochs < 1 or a.benchmark_trials < 1 or a.benchmark_repeats < 1:
         raise ValueError('epochs and benchmark trials/repeats must be positive')
     gpu_ids = [int(g) for g in a.gpus.split(',')]
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 
+    # F2: the signature covers the training code, not only the CLI settings, so
+    # --resume refuses to mix runs trained under different loss definitions.
+    a.code_fingerprint = code_fingerprint()
     a.run_signature = hashlib.sha256(json.dumps(
-        {k: getattr(a, k) for k in SIGNATURE_FIELDS}, sort_keys=True).encode()).hexdigest()[:16]
+        {**{k: getattr(a, k) for k in SIGNATURE_FIELDS}, 'code': a.code_fingerprint},
+        sort_keys=True).encode()).hexdigest()[:16]
     check_resume_signature(out, a, a.run_signature)
 
     seed_everything(a.data_seed)
@@ -883,11 +1184,16 @@ def run():
     tokenizer = open_clip.get_tokenizer(a.teacher)
     teacher.eval(); teacher.requires_grad_(False)
 
-    train_ix = balanced_indices(labels_of(train_base), a.max_train, a.data_seed)
+    pool_ix = balanced_indices(labels_of(train_base), a.max_train, a.data_seed)
+    # V1: hold out a stratified validation split; students and the teacher-geometry
+    # estimates only see the remaining fit split.
+    train_ix, val_ix = stratified_split(pool_ix, labels_of(train_base)[pool_ix],
+                                        a.val_fraction, a.data_seed)
     test_ix = balanced_indices(labels_of(test_base), a.max_test, a.data_seed)
     ds_train = FMNISTView(train_base, train_ix, student_transform(train=True, augment=not a.no_augment))
+    ds_val = FMNISTView(train_base, val_ix, student_transform())
     ds_test = FMNISTView(test_base, test_ix, student_transform())
-    print(f'Train/test: {len(ds_train)}/{len(ds_test)}')
+    print(f'Train/val/test: {len(ds_train)}/{len(ds_val)}/{len(ds_test)}')
 
     def cache_for(ix, split):
         sig = hashlib.sha256(ix.tobytes() + f'{a.teacher}/{a.pretrained}/FMNIST/{split}'.encode()).hexdigest()[:16]
@@ -924,21 +1230,27 @@ def run():
     mle_d = max(2, min(vlm_dim, math.ceil(mle_float)))
     stab = mle_stability(teacher_feats, a.id_ks, a.id_samples, a.data_seed, a.id_repeats)
 
-    pca_d = pca_dimension(teacher_feats, a.pca_variance_threshold)          # B1
-    pca_d = max(2, min(vlm_dim, pca_d))
-    erank_d = effective_rank_dimension(teacher_feats)                         # B2
-    erank_d = max(2, min(vlm_dim, erank_d))
-    fixed_d = fixed_width_nearest(mle_d, BACKBONE_DIM[a.student])            # B3
+    # P1: primary PCA / effective rank on the same L2-normalised space as the MLE;
+    # raw-feature values are recorded as an ablation.
+    pca_d = max(2, min(vlm_dim, pca_dimension(teacher_feats, a.pca_variance_threshold)))
+    erank_d = max(2, min(vlm_dim, effective_rank_dimension(teacher_feats)))
+    pca_d_raw = max(2, min(vlm_dim, pca_dimension(teacher_feats, a.pca_variance_threshold,
+                                                  normalize=False)))
+    erank_d_raw = max(2, min(vlm_dim, effective_rank_dimension(teacher_feats, normalize=False)))
+    fixed_widths = fixed_widths_for(BACKBONE_DIM[a.student])                  # B3
 
     print(id_table.to_string(index=False))
     print(f"MLE d={mle_d} (stability {stab['mean']:.2f} +/- {stab['std']:.2f}) | "
-          f"PCA d={pca_d} | Effective rank d={erank_d} | Fixed width d={fixed_d}")
+          f"PCA d={pca_d} (raw {pca_d_raw}) | Effective rank d={erank_d} (raw {erank_d_raw}) | "
+          f"Fixed widths {fixed_widths}")
 
     (out / 'dimension_estimates.json').write_text(json.dumps({           # B7
         'mle_d': mle_d, 'mle_float': mle_float, 'mle_stability': stab,
+        'feature_space': 'L2-normalised CLIP image embeddings (MLE, PCA, effective rank)',
         'pca_d': pca_d, 'pca_variance_threshold': a.pca_variance_threshold,
         'erank_d': erank_d,
-        'fixed_d': fixed_d, 'fixed_width_grid': FIXED_WIDTH_GRID,
+        'ablation_raw_features': {'pca_d': pca_d_raw, 'erank_d': erank_d_raw},
+        'fixed_widths': fixed_widths, 'fixed_width_grid': FIXED_WIDTHS_INDEPENDENT,
         'vlm_dim': vlm_dim,
     }, indent=2))
     (out / 'mle_summary.json').write_text(json.dumps(
@@ -949,19 +1261,21 @@ def run():
     if device.type == 'cuda':
         torch.cuda.empty_cache()
 
-    # B5: parse dims with pca and erank tokens
-    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, BACKBONE_DIM[a.student])
-    configs = [(m, d, s) for s in seeds for d in dims for m in modes]
-    print(f'Dims {dims} | modes {modes} | seeds {seeds} | {len(configs)} runs on GPUs {gpu_ids}')
-    print(f'Bottleneck strategies: MLE={mle_d}, PCA={pca_d}, Erank={erank_d}, Fixed={fixed_d}, '
-          f'Oracle=best on grid (upper bound)')
+    # B5: parse dims with pca and erank tokens; fixed widths are always included
+    full_d = BACKBONE_DIM[a.student]
+    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, full_d, fixed_widths)
+    configs = [(m, d, s, 'linear') for s in seeds for d in dims for m in modes]
+    if not a.no_identity_baseline:                                            # G1
+        configs += [(m, full_d, s, 'identity') for s in seeds for m in modes]
+    print(f'Dims {dims} (+ identity baseline at {full_d}: {not a.no_identity_baseline}) | '
+          f'modes {modes} | seeds {seeds} | {len(configs)} runs on GPUs {gpu_ids}')
 
     done_rows = []
     if a.resume and (out / 'results_per_seed.csv').exists():
         prev = pd.read_csv(out / 'results_per_seed.csv')
         done = {t for t in prev['tag'] if (out / f'{t}.pt').exists()}
         done_rows = prev[prev['tag'].isin(done)].to_dict('records')
-        configs = [c for c in configs if f'{c[0]}_d{c[1]}_seed{c[2]}' not in done]
+        configs = [c for c in configs if run_tag(*c) not in done]
         print(f'Resume: reusing {len(done_rows)} finished runs, {len(configs)} left to train')
 
     results, curves_all, bench_rows = list(done_rows), [], []
@@ -976,49 +1290,73 @@ def run():
             bench_rows.extend(bench_trial_rows(res['tag'], bench))
         pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
 
+    lost, failed = [], {}
     if len(gpu_ids) == 1 or device.type != 'cuda':
-        for m, d, s in configs:
-            collect(*train_one(m, d, s, teacher_feats, teacher_txt, ds_train, ds_test,
-                               vlm_dim, device, a))
+        for cfg in configs:
+            try:
+                collect(*train_one(*cfg, teacher_feats, teacher_txt, ds_train, ds_val,
+                                   vlm_dim, device, a))
+            except Exception:                                                  # P6
+                import traceback
+                failed[run_tag(*cfg)] = traceback.format_exc()
+                print(f'[ERROR] {run_tag(*cfg)}\n{failed[run_tag(*cfg)]}', flush=True)
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
     elif configs:
         shared = {'a': a, 'teacher_feats': teacher_feats, 'teacher_txt': teacher_txt,
-                  'vlm_dim': vlm_dim, 'train_ids': train_ix, 'test_ids': test_ix}
-        ctx = mp.get_context('spawn')
-        q = ctx.Queue()
+                  'vlm_dim': vlm_dim, 'train_ids': train_ix, 'val_ids': val_ix}
         buckets = [configs[i::len(gpu_ids)] for i in range(len(gpu_ids))]
-        procs = [ctx.Process(target=_worker, args=(g, b, shared, q))
-                 for g, b in zip(gpu_ids, buckets)]
-        for p in procs:
-            p.start()
-        for n in range(len(configs)):
-            item = q.get()
-            if item[0] == 'err':
-                print(f'[ERROR] {item[1]}\n{item[2]}', flush=True)
-            else:
-                collect(*item[1:])
-                print(f'  collected {n + 1}/{len(configs)}: {item[1]["tag"]}', flush=True)
-        for p in procs:
-            p.join()
+        lost, failed = dispatch_workers(_worker, gpu_ids, buckets, shared, collect,
+                                        poll_seconds=a.worker_poll_seconds,
+                                        stall_seconds=a.worker_stall_hours * 3600)
+    (out / 'lost_runs.json').write_text(json.dumps(lost, indent=2))
+    (out / 'failed_runs.json').write_text(json.dumps(failed, indent=2))
+    if lost or failed:
+        print(f'WARNING: {len(lost)} lost and {len(failed)} failed run(s); see lost_runs.json '
+              'and failed_runs.json. Rerun the same command with --resume to retry them.',
+              flush=True)
 
-    wanted = {f'{m}_d{d}_seed{s}' for s in seeds for d in dims for m in modes}
+    wanted = {run_tag(m, d, s) for s in seeds for d in dims for m in modes}
+    if not a.no_identity_baseline:
+        wanted |= {run_tag(m, full_d, s, 'identity') for s in seeds for m in modes}
     results = [r for r in results if r['tag'] in wanted]
+    for r in results:                       # rows resumed from older runs
+        r.setdefault('bottleneck_kind', 'linear')
+    # Persist completed checkpoints/results before checking completeness. Do not
+    # publish an oracle or Pareto analysis from a partial dimension x seed grid
+    # unless --allow-partial is given (F4).
+    pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
+    missing_tags = sorted(wanted - {r['tag'] for r in results})
+    (out / 'missing_runs.json').write_text(json.dumps(missing_tags, indent=2))
+    complete = not (lost or failed or missing_tags)
+    if not complete and not a.allow_partial:
+        raise RuntimeError(
+            f'Incomplete experiment: {len(failed)} failed, {len(lost)} lost, '
+            f'{len(missing_tags)} missing configuration(s). Completed checkpoints '
+            f'and results_per_seed.csv are preserved under {out}. '
+            'Correct the failures and rerun with --resume, or pass --allow-partial; '
+            'selection/oracle results have NOT been generated from this partial grid.')
+    if not complete:
+        print(f'WARNING: --allow-partial: analysing an incomplete grid ({len(missing_tags)} '
+              'missing run(s)). Widths without all seeds are excluded from selection.',
+              flush=True)
     if not results:
         raise RuntimeError('No configuration finished; see [ERROR] messages above.')
     if a.benchmark == 'after':
         print('\nBenchmarking saved models sequentially on an idle GPU ...')
         bench_rows = benchmark_saved(results, out, device, a)
+    (out / 'hardware.json').write_text(json.dumps(hardware_info(device, a), indent=2))  # P6
 
-    pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
     pd.DataFrame(curves_all).to_csv(out / 'training_history.csv', index=False)
     pd.DataFrame(bench_rows).to_csv(out / 'benchmark_trials.csv', index=False)
 
+    # ── Summary on validation accuracy (test not yet evaluated) ────────────────
     frame = pd.DataFrame(results)
     expected = len(seeds)
-    summary = frame.groupby(['mode', 'bottleneck_d']).agg(
-        has_bottleneck_layer=('has_bottleneck_layer', 'first'),
-        test_accuracy_pct=('test_accuracy_pct', 'mean'),
-        test_accuracy_std=('test_accuracy_pct', 'std'),
-        test_macro_f1_pct=('test_macro_f1_pct', 'mean'),
+    summary = frame.groupby(['mode', 'bottleneck_kind', 'bottleneck_d']).agg(
+        val_accuracy_pct=('val_accuracy_pct', 'mean'),
+        val_accuracy_std=('val_accuracy_pct', 'std'),
+        val_macro_f1_pct=('val_macro_f1_pct', 'mean'),
         latency_ms=('latency_ms', 'mean'), latency_iqr_ms=('latency_iqr_ms', 'mean'),
         energy_mJ=('energy_mJ', 'mean'), energy_iqr_mJ=('energy_iqr_mJ', 'mean'),
         parameters=('parameters', 'first'), train_seconds=('train_seconds', 'mean'),
@@ -1026,14 +1364,18 @@ def run():
         last_epoch_ce_drop_pct=('last_epoch_ce_drop_pct', 'mean'),
         n_seeds=('seed', 'count')).reset_index()
 
-    summary['mle_selected'] = summary['bottleneck_d'].eq(mle_d)
-    summary['pca_selected'] = summary['bottleneck_d'].eq(pca_d)
-    summary['erank_selected'] = summary['bottleneck_d'].eq(erank_d)
-    summary['fixed_selected'] = summary['bottleneck_d'].eq(fixed_d)
+    lin = summary['bottleneck_kind'].eq('linear')
+    all_seeds = summary['n_seeds'] >= expected          # F4: only complete groups are selectable
+    excluded = summary.loc[~all_seeds, ['mode', 'bottleneck_kind', 'bottleneck_d', 'n_seeds']]
+    summary['mle_selected'] = lin & summary['bottleneck_d'].eq(mle_d)
+    summary['pca_selected'] = lin & summary['bottleneck_d'].eq(pca_d)
+    summary['erank_selected'] = lin & summary['bottleneck_d'].eq(erank_d)
+    summary['fixed_selected'] = lin & summary['bottleneck_d'].isin(fixed_widths)
 
     summary['converged'] = summary['last_epoch_ce_drop_pct'] < 2.0
     if (~summary['converged']).any():
-        bad = summary.loc[~summary['converged'], ['mode', 'bottleneck_d', 'last_epoch_ce_drop_pct']]
+        bad = summary.loc[~summary['converged'], ['mode', 'bottleneck_kind', 'bottleneck_d',
+                                                  'last_epoch_ce_drop_pct']]
         print('WARNING: training loss still falling >2% in last epoch:\n'
               f'{bad.to_string(index=False)}\nIncrease --epochs before comparing bottleneck sizes.')
     if (summary['n_seeds'] < expected).any():
@@ -1046,91 +1388,132 @@ def run():
         summary.loc[idx, 'pareto_within_mode'] = pareto_mask(summary.loc[idx].reset_index(drop=True))
     pfreq = pareto_freq_per_seed(frame) if expected > 1 else {}
     summary['nondominated_freq_per_seed'] = [
-        pfreq.get((str(r['mode']), int(r['bottleneck_d'])), float('nan'))
+        pfreq.get((str(r['mode']), str(r['bottleneck_kind']), int(r['bottleneck_d'])), float('nan'))
         if r['n_seeds'] == expected else float('nan')
         for _, r in summary.iterrows()]
-    summary.to_csv(out / 'pareto_summary.csv', index=False)
 
-    # ── Selection analysis: all 5 strategies per mode (B4, B6) ───────────────
-    selection = {}
+    # ── Selection: validation accuracy only, on the linear-bottleneck curve ────
+    selection, chosen = {}, {}                 # chosen[mode] = {strategy: (d, kind)}
     for m in modes:
-        sub = summary[summary['mode'] == m]
+        sub = summary[(summary['mode'] == m) & lin & all_seeds]
         if sub.empty:
             continue
-        best = float(sub['test_accuracy_pct'].max())
+        best_val = float(sub[SELECT_COL].max())
         gains, knee = knee_analysis(sub, a.knee_gain)
         d_eps = d_eps_at(sub, a.accuracy_tolerance)
+        oracle_d = int(sub.loc[sub[SELECT_COL].idxmax(), 'bottleneck_d'])   # max val accuracy
+        oracle_1pp_d = d_eps_at(sub, 1.0)                                   # smallest d within 1 pp
 
-        # B4: oracle = best d on the evaluated grid (upper bound)
-        oracle_d = int(sub.loc[sub['test_accuracy_pct'].idxmax(), 'bottleneck_d'])
-        oracle_acc = best
+        def strategy(d):
+            return {'d': int(d), 'val_accuracy_pct': _acc_at(sub, d),
+                    'val_gap_to_best_pp': best_val - _acc_at(sub, d),
+                    'd_minus_oracle_1pp': int(d) - oracle_1pp_d,      # >0 too wide, <0 too narrow
+                    'within_1pp_of_best_val': bool(_acc_at(sub, d) >= best_val - 1.0)}
 
-        acc_mle = _acc_at(sub, mle_d)
-        acc_pca = _acc_at(sub, pca_d)
-        acc_erank = _acc_at(sub, erank_d)
-        acc_fixed = _acc_at(sub, fixed_d)
+        picks = {f'fixed_{fw}': fw for fw in fixed_widths}
+        picks.update({'mle': mle_d, 'pca': pca_d, 'erank': erank_d,
+                      'oracle_max_val': oracle_d, 'oracle_1pp': oracle_1pp_d})
+        chosen[m] = {k: (d, 'linear') for k, d in picks.items()}
+        selection[m] = {'strategies': {k: strategy(d) for k, d in picks.items()},
+                        'best_val_accuracy_pct': best_val,
+                        'mle_equals_d_eps': mle_d == d_eps,
+                        'd_eps': d_eps,
+                        'd_eps_by_tolerance': {str(t): d_eps_at(sub, t) for t in (0.5, 1.0, 2.0)},
+                        'knee_d': knee, 'knee_gain_threshold_pp': a.knee_gain,
+                        'gain_per_doubling': gains}
+        idr = summary[(summary['mode'] == m) & summary['bottleneck_kind'].eq('identity') & all_seeds]
+        if not idr.empty:                                                     # G1
+            chosen[m]['identity_no_bottleneck'] = (full_d, 'identity')
+            selection[m]['identity_no_bottleneck'] = {
+                'd': full_d, 'val_accuracy_pct': float(idr[SELECT_COL].iloc[0]),
+                'val_gap_to_best_linear_pp': best_val - float(idr[SELECT_COL].iloc[0])}
 
-        selection[m] = {
-            # ── Strategy 1: Fixed width (baseline, B3) ─────────────────────
-            'fixed_d': fixed_d,
-            'fixed_accuracy_pct': acc_fixed,
-            'fixed_gap_pp': oracle_acc - acc_fixed,
-            # ── Strategy 2: MLE-guided (proposed) ──────────────────────────
-            'mle_d': mle_d,
-            'mle_accuracy_pct': acc_mle,
-            'mle_gap_pp': oracle_acc - acc_mle,
-            'mle_equals_d_eps': mle_d == d_eps,
-            # ── Strategy 3: PCA-based (B1) ──────────────────────────────────
-            'pca_d': pca_d,
-            'pca_accuracy_pct': acc_pca,
-            'pca_gap_pp': oracle_acc - acc_pca,
-            # ── Strategy 4: Effective-rank-based (B2) ──────────────────────
-            'erank_d': erank_d,
-            'erank_accuracy_pct': acc_erank,
-            'erank_gap_pp': oracle_acc - acc_erank,
-            # ── Strategy 5: Validation-grid oracle (upper bound, B4) ────────
-            'oracle_d': oracle_d,
-            'oracle_accuracy_pct': oracle_acc,
-            # ── Shared analysis ─────────────────────────────────────────────
-            'best_accuracy_pct': best,
-            'd_eps': d_eps,
-            'd_eps_by_tolerance': {str(t): d_eps_at(sub, t) for t in (0.5, 1.0, 2.0)},
-            'knee_d': knee, 'knee_gain_threshold_pp': a.knee_gain,
-            'gain_per_doubling': gains,
-        }
+    # ── Test set: evaluated once, only for the selected models (T1) ────────────
+    by_tag = {r['tag']: r for r in results}
+    if a.test_scope == 'all':
+        test_tags = sorted(by_tag)
+    else:
+        test_tags = sorted({run_tag(m, d, s, kind) for m, picks in chosen.items()
+                            for d, kind in picks.values() for s in seeds} & set(by_tag))
+    print(f'\nEvaluating {len(test_tags)} selected model(s) on the test set '
+          f'(scope: {a.test_scope}) ...')
+    scored = evaluate_saved_on_test([by_tag[t] for t in test_tags], out, ds_test, device, a)
+    for r in results:
+        t = scored.get(r['tag'])
+        r['test_accuracy_pct'] = t['accuracy_pct'] if t else float('nan')
+        r['test_macro_f1_pct'] = t['macro_f1_pct'] if t else float('nan')
+        r['test_evaluated'] = t is not None
+    pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
+
+    def test_stats(m, d, kind):
+        vals = [scored[run_tag(m, d, s, kind)]['accuracy_pct'] for s in seeds
+                if run_tag(m, d, s, kind) in scored]
+        return {'test_accuracy_pct': float(np.mean(vals)) if vals else float('nan'),
+                'test_accuracy_std': float(np.std(vals, ddof=1)) if len(vals) > 1 else float('nan'),
+                'test_n_seeds': len(vals)}
+
+    for m, picks in chosen.items():
+        for name, (d, kind) in picks.items():
+            target = (selection[m]['identity_no_bottleneck'] if name == 'identity_no_bottleneck'
+                      else selection[m]['strategies'][name])
+            target.update(test_stats(m, d, kind))
+
+    tmean = frame.assign(test_accuracy_pct=[r['test_accuracy_pct'] for r in results]) \
+                 .groupby(['mode', 'bottleneck_kind', 'bottleneck_d'])['test_accuracy_pct'].mean()
+    summary['test_accuracy_pct'] = [tmean.get((r['mode'], r['bottleneck_kind'], r['bottleneck_d']),
+                                              float('nan')) for _, r in summary.iterrows()]
+    summary.to_csv(out / 'pareto_summary.csv', index=False)
 
     (out / 'selection.json').write_text(json.dumps({
         'dataset': 'FashionMNIST',
         'num_classes_minus_1': NUM_CLASSES - 1,
         'dimension_estimates': {
-            'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d, 'fixed_d': fixed_d,
-            'vlm_dim': vlm_dim,
+            'feature_space': 'L2-normalised CLIP image embeddings',
+            'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d,
+            'ablation_raw_features': {'pca_d': pca_d_raw, 'erank_d': erank_d_raw},
+            'fixed_widths': fixed_widths, 'vlm_dim': vlm_dim, 'backbone_dim': full_d,
         },
         'mle_stability': stab,
         'teacher_zero_shot': zs,
         'run_signature': a.run_signature,
+        'code_fingerprint': a.code_fingerprint,
+        'complete': complete,
+        'missing_runs': len(missing_tags),
+        'excluded_incomplete_groups': excluded.to_dict('records'),
         'accuracy_tolerance_pp': a.accuracy_tolerance,
+        'selection_split': f'validation ({a.val_fraction:.0%} of training pool, stratified)',
+        'test_scope': a.test_scope,
+        'split_sizes': {'train': int(len(train_ix)), 'val': int(len(val_ix)), 'test': int(len(test_ix))},
+        'student_augmentation': 'none (matched views)' if a.no_augment else
+                                'RandomResizedCrop(0.72-1.0) + flip; teacher features from '
+                                'un-augmented images (run --no-augment for the matched-view ablation)',
+        'full_width_note': (f"'d={full_d}' rows with bottleneck_kind='linear' contain a trainable "
+                            f'{full_d}x{full_d} projection; bottleneck_kind=\'identity\' rows are '
+                            'the true no-bottleneck baseline (backbone -> classifier).'),
         'modes': selection,
         'strategy_references': {
             'fixed': 'Romero et al., FitNets, ICLR 2015',
-            
+            'mle': 'Levina & Bickel, NIPS 2004 (proposed)',
             'pca': 'Jolliffe, Principal Component Analysis, Springer 2002',
             'erank': 'Roy & Vetterli, EUSIPCO 2007',
-            'oracle': 'Unreachable upper bound — uses test labels',
-
-            'mle': 'Levina & Bickel, NIPS 2004 (proposed)',
+            'oracle': 'Validation-grid oracle: width chosen on the held-out validation split '
+                      '(max accuracy, and smallest width within 1 pp)',
         },
         'distillation_references': {
             'labels': 'Cross-entropy only (baseline)',
             'feat': 'Feature KD: MSE + cosine alignment',
-            'rkd': 'Park et al., RKD, CVPR 2019',
-            'crd': 'Tian et al., CRD, ICLR 2020',
-            'dkd': 'Zhao et al., DKD, CVPR 2022',
-            'vl2lite': 'VL2Lite-style: relational + linguistic KD',
+            'rkd': 'Park et al., RKD, CVPR 2019 (distance + angle)',
+            'crd': 'Tian et al., CRD, ICLR 2020 (in-batch contrastive variant)',
+            'dkd': 'Zhao et al., DKD, CVPR 2022 (DKD-style: beta=1 by default, no warm-up)',
+            'vl2lite': 'VL2Lite-style: distance-only relational (weight 1) + linguistic KD',
         },
-        'note': ('d_eps and knee_d computed on test set — post-hoc analysis only. '
-                 'Pareto claims cover only the evaluated grid. '
-                 'Oracle is an upper bound; it uses test accuracy and is not deployable.'),
+        'note': ('Bottleneck selection, d_eps and knee_d are computed using held-out '
+                 'validation accuracy. The test set is evaluated once, after selection, '
+                 + ('only for the models chosen by a selection strategy. '
+                    if a.test_scope == 'selected' else
+                    'for every candidate (exploratory; not used for any decision). ')
+                 + 'Pareto comparisons use validation accuracy, are restricted to the '
+                 'evaluated models, and refer to the measured hardware (hardware.json).'),
     }, indent=2))
 
     (out / 'config.json').write_text(json.dumps(
