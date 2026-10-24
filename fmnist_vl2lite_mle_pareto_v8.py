@@ -60,6 +60,9 @@ v8 additions to v7
   N3  Teacher references: CLIP zero-shot and a linear probe on frozen CLIP features,
       saved in teacher_zero_shot.json and selection.json. Reference points, not
       upper bounds for fine-tuned students.
+  W5  Every file write goes to a temporary file that is swapped into place, with
+      retries. Fixes "open file failed with error code: 32" when OneDrive, Dropbox
+      or antivirus holds a file open. A warning is printed if --out is in a synced folder.
   Known, not changed in code: modes weight the classification loss differently
       (labels/feat: 1; rkd/crd/dkd/vl2lite: annealed lam_cls 0.5 -> 0.8). Report it
       or run a sensitivity check. DKD uses beta=1 and no warm-up; with no validation split,
@@ -413,6 +416,79 @@ def fixed_widths_for(full_d: int) -> list:
     return [w for w in FIXED_WIDTHS_INDEPENDENT if w <= full_d]
 
 
+# ── Safe file writes (W5) ─────────────────────────────────────────────────────
+# On Windows a file another process holds open (OneDrive / Dropbox sync, antivirus,
+# Explorer preview) cannot be written: "open file failed with error code: 32".
+# Every write goes to a unique temporary file first, which is then swapped into place
+# with os.replace. Both steps retry with exponential backoff.
+IO_RETRIES = 8
+
+
+def _retry_io(fn, what, attempts=None, base_delay=0.5):
+    attempts = attempts or IO_RETRIES
+    for i in range(attempts):
+        try:
+            return fn()
+        except (PermissionError, OSError, RuntimeError) as e:
+            if i == attempts - 1:
+                raise RuntimeError(
+                    f'{what} failed after {attempts} attempts: {e}. The file is locked by '
+                    'another program. If --out is inside OneDrive/Dropbox, move it to a '
+                    'local folder (for example C:\\vl2lite_runs) or pause syncing.') from e
+            wait = base_delay * 2 ** i
+            print(f'  WARNING: {what} failed ({type(e).__name__}: {str(e)[:90]}); '
+                  f'retrying in {wait:.1f}s', flush=True)
+            time.sleep(wait)
+
+
+def _atomic(path, write_tmp):
+    path = Path(path)
+    tmp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    try:
+        _retry_io(lambda: write_tmp(tmp), f'writing {tmp.name}')
+        _retry_io(lambda: os.replace(tmp, path), f'replacing {path.name}')
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def safe_save(obj, path):
+    """torch.save through a temporary file, with retries."""
+    _atomic(path, lambda tmp: torch.save(obj, tmp))
+
+
+def safe_write_text(path, text):
+    """Path.write_text through a temporary file, with retries."""
+    _atomic(path, lambda tmp: Path(tmp).write_text(text, encoding='utf-8'))
+
+
+def safe_to_csv(df, path, **kwargs):
+    """DataFrame.to_csv through a temporary file, with retries."""
+    _atomic(path, lambda tmp: df.to_csv(tmp, **kwargs))
+
+
+def safe_unlink(path):
+    try:
+        _retry_io(lambda: Path(path).unlink(missing_ok=True), f'deleting {Path(path).name}',
+                  attempts=4)
+    except RuntimeError as e:
+        print(f'  WARNING: {e}', flush=True)
+
+
+def warn_if_synced_folder(path):
+    s = str(Path(path).resolve()).lower()
+    for name in ('onedrive', 'dropbox', 'google drive', 'icloud'):
+        if name in s:
+            print(f'WARNING: --out is inside a {name} folder ({Path(path).resolve()}). Sync '
+                  'clients lock files while uploading, which can make writes fail on Windows. '
+                  'Writes are retried, but a local folder such as C:\\vl2lite_runs is safer '
+                  'and faster.', flush=True)
+            return
+
+
 # ── Teacher cache ─────────────────────────────────────────────────────────────
 @torch.no_grad()
 def build_teacher_cache(teacher, dataset, device, batch_size, workers, cache_path, save_every=100):
@@ -454,14 +530,17 @@ def build_teacher_cache(teacher, dataset, device, batch_size, workers, cache_pat
         if b % save_every == 0 or b == n_batches:
             chunks = [torch.cat(chunks)]
             n_done = chunks[0].shape[0]
-            torch.save({'features': chunks[0], 'n_total': n_total}, partial)
+            try:                    # W5: progress snapshot only; never fatal
+                safe_save({'features': chunks[0], 'n_total': n_total}, partial)
+            except RuntimeError as e:
+                print(f'  WARNING: partial teacher cache not saved ({e}); continuing.', flush=True)
             rate = (n_done - start) / max(time.perf_counter() - t0, 1e-6)
             eta = (n_total - n_done) / max(rate, 1e-6)
             print(f'  {n_done}/{n_total} images ({rate:.0f} img/s, ~{eta / 60:.1f} min left)', flush=True)
     feats = torch.cat(chunks)
     assert feats.shape[0] == n_total, (feats.shape, n_total)
-    torch.save({'features': feats}, cache_path)
-    partial.unlink(missing_ok=True)
+    safe_save({'features': feats}, cache_path)
+    safe_unlink(partial)
     return feats
 
 
@@ -930,7 +1009,7 @@ def check_resume_signature(out, a, run_signature):
         raise RuntimeError('Results produced by older script version. Use a fresh --out directory.')
     if sigfile.exists() and sigfile.read_text().strip() != run_signature:
         raise RuntimeError('Training settings differ from existing run. Use a fresh --out directory.')
-    sigfile.write_text(run_signature)
+    safe_write_text(sigfile, run_signature)
 
 
 # ── Training ───────────────────────────────────────────────────────────────────
@@ -1096,10 +1175,10 @@ def train_one(mode, d_b, seed, kind, teacher_feats, teacher_txt, ds_train, ds_te
     deployed = Deployable(student)
     out_dir = Path(a.out)
     bench = benchmark(deployed.to(device), device, a) if a.benchmark == 'inline' else None
-    torch.save({'student_deployed': deployed.cpu().state_dict(), 'architecture': a.student,
+    safe_save({'student_deployed': deployed.cpu().state_dict(), 'architecture': a.student,
                 'bottleneck_d': d_b, 'bottleneck_kind': kind, 'mode': mode, 'seed': seed},
                out_dir / f'{tag}.pt')
-    pd.DataFrame(curves).to_csv(out_dir / f'{tag}_history.csv', index=False)
+    safe_to_csv(pd.DataFrame(curves), out_dir / f'{tag}_history.csv', index=False)
     ce_last = curves[-1]['cls']
     ce_prev = curves[-2]['cls'] if len(curves) > 1 else float('nan')
     ce_drop = 100.0 * (ce_prev - ce_last) / ce_prev if ce_prev and np.isfinite(ce_prev) else float('nan')
@@ -1301,9 +1380,9 @@ def analyze_and_write(results, info, a, out, prefix=''):
                 'test_accuracy_std': float(idr['test_accuracy_std'].iloc[0]),
                 'gap_to_best_linear_pp': best - id_acc}
 
-    summary.to_csv(out / f'{prefix}pareto_summary.csv', index=False)
+    safe_to_csv(summary, out / f'{prefix}pareto_summary.csv', index=False)
 
-    (out / f'{prefix}selection.json').write_text(json.dumps({
+    safe_write_text(out / f'{prefix}selection.json', json.dumps({
         'dataset': 'FashionMNIST',
         'num_classes_minus_1': NUM_CLASSES - 1,
         'dimension_estimates': {
@@ -1415,7 +1494,7 @@ def analyze_only(a, seeds, modes, out):
         raise RuntimeError('No finished run in results_per_seed.csv matches the requested '
                            '--dims/--modes/--seeds.')
     missing_tags = sorted(wanted - {r['tag'] for r in results})
-    (out / 'interim_missing_runs.json').write_text(json.dumps(missing_tags, indent=2))
+    safe_write_text(out / 'interim_missing_runs.json', json.dumps(missing_tags, indent=2))
     done_d = sorted({int(r['bottleneck_d']) for r in results if r['bottleneck_kind'] == 'linear'})
     print(f'--analyze-only: {len(results)} finished / {len(wanted)} requested run(s); '
           f'widths so far {done_d}; MLE d={mle_d}')
@@ -1458,6 +1537,7 @@ def run():
         return
     gpu_ids = [int(g) for g in a.gpus.split(',')]
     out.mkdir(parents=True, exist_ok=True)
+    warn_if_synced_folder(out)                                                # W5
 
     # F2: the signature covers the training code, not only the CLI settings, so
     # --resume refuses to mix runs trained under different loss definitions.
@@ -1531,14 +1611,14 @@ def run():
     zs['reference_note'] = ('CLIP ViT teacher, frozen: zero-shot from class prompts and a '
                             'logistic-regression linear probe on L2-normalised image features. '
                             'Reference points, not upper bounds for fine-tuned CNN students.')
-    (out / 'teacher_zero_shot.json').write_text(json.dumps(zs, indent=2))
+    safe_write_text(out / 'teacher_zero_shot.json', json.dumps(zs, indent=2))
     print(f"Teacher feats {tuple(teacher_feats.shape)}, CLIP scale {clip_scale:.1f}, "
           f"KD scale {a.kd_logit_scale_used:.1f}, zero-shot test {zs['test_zero_shot_pct']:.2f}%, "
           f"linear probe test {zs['test_linear_probe_pct']:.2f}%")
 
     # ── Dimensionality estimation (B1, B2, MLE) ───────────────────────────────
     id_table = mle_dimension(teacher_feats, a.id_ks, a.id_samples, a.data_seed)
-    id_table.to_csv(out / 'levina_bickel_mle.csv', index=False)
+    safe_to_csv(id_table, out / 'levina_bickel_mle.csv', index=False)
     mle_float = float(id_table['mle_id'].median())
     mle_d = max(2, min(vlm_dim, math.ceil(mle_float)))
     stab = mle_stability(teacher_feats, a.id_ks, a.id_samples, a.data_seed, a.id_repeats)
@@ -1557,7 +1637,7 @@ def run():
           f"PCA d={pca_d} (raw {pca_d_raw}) | Effective rank d={erank_d} (raw {erank_d_raw}) | "
           f"Fixed widths {fixed_widths}")
 
-    (out / 'dimension_estimates.json').write_text(json.dumps({           # B7
+    safe_write_text(out / 'dimension_estimates.json', json.dumps({           # B7
         'mle_d': mle_d, 'mle_float': mle_float, 'mle_stability': stab,
         'feature_space': 'L2-normalised CLIP image embeddings (MLE, PCA, effective rank)',
         'pca_d': pca_d, 'pca_variance_threshold': a.pca_variance_threshold,
@@ -1567,7 +1647,7 @@ def run():
         'vlm_dim': vlm_dim,
         'split_sizes': {'train': int(len(train_ix)), 'test': int(len(test_ix))},
     }, indent=2))
-    (out / 'mle_summary.json').write_text(json.dumps(
+    safe_write_text(out / 'mle_summary.json', json.dumps(
         {'mle_by_k': id_table.to_dict('records'), 'mle_median': mle_float, 'mle_d': mle_d,
          'stability': stab, 'num_classes_minus_1': NUM_CLASSES - 1}, indent=2))
 
@@ -1602,7 +1682,7 @@ def run():
         results.append(res); curves_all.extend(curves)
         if bench:
             bench_rows.extend(bench_trial_rows(res['tag'], bench))
-        pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
+        safe_to_csv(pd.DataFrame(results), out / 'results_per_seed.csv', index=False)
 
     lost, failed = [], {}
     if len(gpu_ids) == 1 or device.type != 'cuda':
@@ -1624,8 +1704,8 @@ def run():
         lost, failed = dispatch_workers(_worker, gpu_ids, buckets, shared, collect,
                                         poll_seconds=a.worker_poll_seconds,
                                         stall_seconds=a.worker_stall_hours * 3600)
-    (out / 'lost_runs.json').write_text(json.dumps(lost, indent=2))
-    (out / 'failed_runs.json').write_text(json.dumps(failed, indent=2))
+    safe_write_text(out / 'lost_runs.json', json.dumps(lost, indent=2))
+    safe_write_text(out / 'failed_runs.json', json.dumps(failed, indent=2))
     if lost or failed:
         print(f'WARNING: {len(lost)} lost and {len(failed)} failed run(s); see lost_runs.json '
               'and failed_runs.json. Rerun the same command with --resume to retry them.',
@@ -1640,9 +1720,9 @@ def run():
     # Persist completed checkpoints/results before checking completeness. Do not
     # publish an oracle or Pareto analysis from a partial dimension x seed grid
     # unless --allow-partial is given (F4).
-    pd.DataFrame(results).to_csv(out / 'results_per_seed.csv', index=False)
+    safe_to_csv(pd.DataFrame(results), out / 'results_per_seed.csv', index=False)
     missing_tags = sorted(wanted - {r['tag'] for r in results})
-    (out / 'missing_runs.json').write_text(json.dumps(missing_tags, indent=2))
+    safe_write_text(out / 'missing_runs.json', json.dumps(missing_tags, indent=2))
     complete = not (lost or failed or missing_tags)
     if not complete and not a.allow_partial:
         raise RuntimeError(
@@ -1660,10 +1740,10 @@ def run():
     if a.benchmark == 'after':
         print('\nBenchmarking saved models sequentially on an idle GPU ...')
         bench_rows = benchmark_saved(results, out, device, a)
-    (out / 'hardware.json').write_text(json.dumps(hardware_info(device, a), indent=2))  # P6
+    safe_write_text(out / 'hardware.json', json.dumps(hardware_info(device, a), indent=2))  # P6
 
-    pd.DataFrame(curves_all).to_csv(out / 'training_history.csv', index=False)
-    pd.DataFrame(bench_rows).to_csv(out / 'benchmark_trials.csv', index=False)
+    safe_to_csv(pd.DataFrame(curves_all), out / 'training_history.csv', index=False)
+    safe_to_csv(pd.DataFrame(bench_rows), out / 'benchmark_trials.csv', index=False)
 
     info = {'seeds': seeds, 'modes': modes, 'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d,
             'pca_d_raw': pca_d_raw, 'erank_d_raw': erank_d_raw, 'fixed_widths': fixed_widths,
@@ -1672,7 +1752,7 @@ def run():
             'complete': complete, 'missing_tags': missing_tags,
             'min_seeds': a.min_seeds or len(seeds)}
     analyze_and_write(results, info, a, out)
-    (out / 'config.json').write_text(json.dumps(
+    safe_write_text(out / 'config.json', json.dumps(
         {k: str(v) if isinstance(v, Path) else v for k, v in vars(a).items()}, indent=2))
 
 
