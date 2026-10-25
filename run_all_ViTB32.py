@@ -26,8 +26,8 @@ from pathlib import Path
 # Datasets to run, in order. Comment out lines you do not want.
 # name: (training script, extra flags for that dataset)
 DATASETS = {
-    'fmnist':         ('fmnist_vl2lite_mle_pareto_v8.py',       []),
-    # 'svhn':         ('svhn_vl2lite_mle_pareto_v8.py',         []),
+    #'fmnist':         ('fmnist_vl2lite_mle_pareto_v8.py',       []),
+     'svhn':         ('svhn_vl2lite_mle_pareto_v8.py',         []),
     # 'cifar10':      ('cifar10_vl2lite_mle_pareto_v8.py',      []),
     # 'cifar100':     ('cifar100_vl2lite_mle_pareto_v8.py',     []),
     # 'tinyimagenet': ('tinyimagenet_vl2lite_mle_pareto_v8.py', []),
