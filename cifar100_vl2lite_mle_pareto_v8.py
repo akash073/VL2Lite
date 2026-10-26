@@ -68,6 +68,12 @@ v8 additions to v7
       (the generic grid jumps from 128 to the backbone width).
   C1  CIFAR-100: also records top-5 test accuracy (results, summary). Selection and
       the oracles still use top-1 accuracy.
+  M2  Manifold-capacity predictor (Cohen et al., Nat. Commun. 2020): per-class radius R_M,
+      dimension D_M and centroid correlation of the CLIP embeddings; capacity
+      alpha_M ~ (1 + R_M^-2) / D_M (Gaussian approximation), predicted width
+      'cap' = C / alpha_M. Unlike the MLE it uses labels, so it reflects class count,
+      class spread and class overlap. Saved in manifold_geometry.json; token 'cap' in
+      --dims; strategy 'cap' in selection.json.
   Known, not changed in code: modes weight the classification loss differently
       (labels/feat: 1; rkd/crd/dkd/vl2lite: annealed lam_cls 0.5 -> 0.8). Report it
       or run a sensitivity check. DKD uses beta=1 and no warm-up; with no validation split,
@@ -239,8 +245,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--id-ks', type=int, nargs='+', default=[5, 10, 20, 50])
     p.add_argument('--id-repeats', type=int, default=5)
     p.add_argument('--dims', default='2,4,8,12,16,24,32,48,64,96,128,192,256,'
-                                     'mle*0.5,mle*0.75,mle,pca,erank,mle*1.25,mle*1.5,full',
-                   help="Tokens: integer, 'mle', 'mle*<factor>', 'pca', 'erank', 'full'.")
+                                     'mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full',
+                   help="Tokens: integer, 'mle', 'mle*<factor>', 'pca', 'erank', 'cap', 'full'.")
     p.add_argument('--modes', default='labels,feat,rkd,crd,dkd,vl2lite,sskd,clipkd',
                    help=f'Comma-separated subset of: {sorted(VALID_MODES)}')
     p.add_argument('--epochs', type=int, default=50)
@@ -310,6 +316,8 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument('--clipkd-w-icl', type=float, default=1.0,
                    help='N2: weight of interactive contrastive learning '
                         '(student image embedding vs CLIP class-text embeddings)')
+    p.add_argument('--manifold-samples-per-class', type=int, default=200,
+                   help='M2: samples per class used for the manifold-geometry estimate')
     p.add_argument('--pca-variance-threshold', type=float, default=0.95,
                    help='B1: cumulative variance threshold for PCA dimension selection')
     # Analysis / benchmark
@@ -448,6 +456,68 @@ def effective_rank_dimension(embeddings, normalize=True) -> int:
 
 # B3: fixed widths are independent of MLE — do not use mle_d to select them.
 FIXED_WIDTHS_INDEPENDENT = [16, 32, 64]
+
+
+def manifold_geometry(embeddings, labels, max_per_class=200, seed=0):
+    """M2: class-manifold geometry and the width it implies for linear separability.
+
+    Following Cohen, Chung, Lee & Sompolinsky (Nature Communications 2020) and Chung,
+    Lee & Sompolinsky (Phys. Rev. X 2018): each class is a manifold (its CLIP embeddings);
+    linear separability depends on manifold radius R_M (relative to the centroid norm),
+    manifold dimension D_M, and centroid correlations. Capacity alpha_M = P / N, and
+    alpha_M ~ (1 + R_M^-2) / D_M, so P = C manifolds need about N = C / alpha_M dimensions.
+
+    Gaussian (covariance) approximation, closed form and fast:
+      R_c = sqrt(trace(Sigma_c)) / ||mu_c||, D_c = participation ratio of Sigma_c,
+      alpha_c = min(2, (1 + R_c^-2) / D_c)   (2 = Cover's point capacity, the upper limit),
+      alpha_M = 1 / mean_c(1 / alpha_c).
+    The exact replica-MFT values use anchor points from a quadratic program (authors' code:
+    github.com/schung039/neural_manifolds_replicaMFT); this approximation does not, and
+    ignores centroid correlations, which are reported separately as rho_center.
+    Embeddings are L2-normalised (same space as the MLE) and centred on the global mean.
+    """
+    x = embeddings.float().numpy().astype('float64') if hasattr(embeddings, 'float') \
+        else np.asarray(embeddings, dtype='float64')
+    y = np.asarray(labels)
+    x = x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
+    x = x - x.mean(axis=0)
+    rng = np.random.default_rng(seed)
+    classes = np.unique(y)
+    rows, centers = [], []
+    for c in classes:
+        idx = np.flatnonzero(y == c)
+        if len(idx) > max_per_class:
+            idx = rng.choice(idx, max_per_class, replace=False)
+        if len(idx) < 3:
+            continue
+        xc = x[idx]
+        mu = xc.mean(axis=0)
+        s = np.linalg.svd(xc - mu, compute_uv=False)
+        lam = s ** 2 / (len(idx) - 1)                      # within-class covariance spectrum
+        radius = float(np.sqrt(lam.sum()) / max(np.linalg.norm(mu), 1e-12))
+        dim = float(lam.sum() ** 2 / max((lam ** 2).sum(), 1e-24))
+        alpha = float(min(2.0, (1.0 + radius ** -2) / dim))
+        rows.append({'class': int(c), 'n': int(len(idx)), 'radius': radius,
+                     'dimension': dim, 'capacity': alpha})
+        centers.append(mu)
+    if len(rows) < 2:
+        raise ValueError('manifold_geometry needs at least two classes with >= 3 samples')
+    cen = np.stack(centers)
+    cen = cen / np.maximum(np.linalg.norm(cen, axis=1, keepdims=True), 1e-12)
+    cos = cen @ cen.T
+    off = ~np.eye(len(cen), dtype=bool)
+    alpha_m = float(1.0 / np.mean([1.0 / r['capacity'] for r in rows]))
+    n_classes = len(rows)
+    return {
+        'method': 'Gaussian approximation of MFTMA (Cohen et al. 2020; Chung et al. 2018)',
+        'n_classes': n_classes, 'samples_per_class_max': int(max_per_class),
+        'radius_mean': float(np.mean([r['radius'] for r in rows])),
+        'dimension_mean': float(np.mean([r['dimension'] for r in rows])),
+        'capacity_alpha_M': alpha_m,
+        'center_correlation': float(np.abs(cos[off]).mean()),
+        'capacity_width': int(np.ceil(n_classes / alpha_m)),   # N = P / alpha_M
+        'per_class': rows,
+    }
 
 
 def fixed_widths_for(full_d: int) -> list:
@@ -1015,7 +1085,7 @@ def _acc_at(sub, d, col=SELECT_COL):
 
 
 # ── Dimension parsing ──────────────────────────────────────────────────────────
-def parse_dims(spec, mle_d, pca_d, erank_d, full_d, fixed_widths=None):
+def parse_dims(spec, mle_d, pca_d, erank_d, full_d, fixed_widths=None, cap_d=None):
     """B5: parse --dims tokens including 'pca' and 'erank'.
     Always injects fixed_widths into the grid so _acc_at never returns NaN
     for the independent fixed-width baselines."""
@@ -1035,6 +1105,10 @@ def parse_dims(spec, mle_d, pca_d, erank_d, full_d, fixed_widths=None):
             d = pca_d
         elif tok == 'erank':
             d = erank_d
+        elif tok == 'cap':                  # M2: manifold-capacity width
+            if cap_d is None:
+                continue
+            d = cap_d
         elif tok == 'full':
             d = full_d
         else:
@@ -1343,6 +1417,7 @@ def analyze_and_write(results, info, a, out, prefix=''):
     fixed_widths, full_d, vlm_dim = info['fixed_widths'], info['full_d'], info['vlm_dim']
     stab, zs, split_sizes = info['stab'], info['zs'], info['split_sizes']
     complete, missing_tags, min_seeds = info['complete'], info['missing_tags'], info['min_seeds']
+    cap_d, mgeo = info.get('cap_d'), info.get('manifold_geometry')
 
     # ── Summary on test accuracy (no validation split) ─────────────────────────
     frame = pd.DataFrame(results)
@@ -1365,6 +1440,7 @@ def analyze_and_write(results, info, a, out, prefix=''):
     summary['mle_selected'] = lin & summary['bottleneck_d'].eq(mle_d)
     summary['pca_selected'] = lin & summary['bottleneck_d'].eq(pca_d)
     summary['erank_selected'] = lin & summary['bottleneck_d'].eq(erank_d)
+    summary['cap_selected'] = lin & summary['bottleneck_d'].eq(cap_d if cap_d else -1)
     summary['fixed_selected'] = lin & summary['bottleneck_d'].isin(fixed_widths)
 
     summary['converged'] = summary['last_epoch_ce_drop_pct'] < 2.0
@@ -1410,6 +1486,8 @@ def analyze_and_write(results, info, a, out, prefix=''):
                     'within_1pp_of_best': bool(acc >= best - 1.0)}
 
         picks = {f'fixed_{fw}': fw for fw in fixed_widths}
+        if cap_d:
+            picks['cap'] = cap_d                                              # M2
         picks.update({'mle': mle_d, 'pca': pca_d, 'erank': erank_d,
                       'oracle_max': oracle_d, 'oracle_1pp': oracle_1pp_d})
         selection[m] = {'strategies': {k: strategy(d) for k, d in picks.items()},
@@ -1434,7 +1512,8 @@ def analyze_and_write(results, info, a, out, prefix=''):
         'num_classes_minus_1': NUM_CLASSES - 1,
         'dimension_estimates': {
             'feature_space': 'L2-normalised CLIP image embeddings',
-            'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d,
+            'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d, 'cap_d': cap_d,
+            'manifold_geometry': mgeo,
             'ablation_raw_features': {'pca_d': pca_d_raw, 'erank_d': erank_d_raw},
             'fixed_widths': fixed_widths, 'vlm_dim': vlm_dim, 'backbone_dim': full_d,
         },
@@ -1462,6 +1541,9 @@ def analyze_and_write(results, info, a, out, prefix=''):
             'mle': 'Levina & Bickel, NIPS 2004 (proposed)',
             'pca': 'Jolliffe, Principal Component Analysis, Springer 2002',
             'erank': 'Roy & Vetterli, EUSIPCO 2007',
+            'cap': ('Cohen, Chung, Lee & Sompolinsky, Nature Communications 2020; Chung, Lee & '
+                    'Sompolinsky, Phys. Rev. X 2018. Width C / alpha_M with alpha_M ~ (1 + R_M^-2) '
+                    '/ D_M (Gaussian approximation; centroid correlations not included)'),
             'oracle': 'Test-grid oracle: width with the highest test accuracy, and smallest '
                       'width within 1 pp of it. Optimistic upper bound; not deployable.',
         },
@@ -1512,7 +1594,8 @@ def analyze_only(a, seeds, modes, out):
     mle_d, pca_d, erank_d = int(est['mle_d']), int(est['pca_d']), int(est['erank_d'])
     raw = est.get('ablation_raw_features', {})
     fixed_widths = est.get('fixed_widths') or fixed_widths_for(full_d)
-    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, full_d, fixed_widths)
+    cap_d = est.get('cap_d')                                                  # M2
+    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, full_d, fixed_widths, cap_d)
 
     frame = pd.read_csv(out / 'results_per_seed.csv')
     sig_file = out / 'run_signature.txt'
@@ -1549,6 +1632,7 @@ def analyze_only(a, seeds, modes, out):
     info = {'seeds': seeds, 'modes': modes, 'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d,
             'pca_d_raw': raw.get('pca_d'), 'erank_d_raw': raw.get('erank_d'),
             'fixed_widths': fixed_widths, 'full_d': full_d, 'vlm_dim': est.get('vlm_dim'),
+            'cap_d': cap_d, 'manifold_geometry': est.get('manifold_geometry'),
             'stab': est.get('mle_stability', {}), 'zs': zs,
             'split_sizes': est.get('split_sizes', 'unknown'),
             'complete': not missing_tags, 'missing_tags': missing_tags,
@@ -1678,6 +1762,13 @@ def run():
                                                   normalize=False)))
     erank_d_raw = max(2, min(vlm_dim, effective_rank_dimension(teacher_feats, normalize=False)))
     fixed_widths = fixed_widths_for(BACKBONE_DIM[a.student])                  # B3
+    mgeo = manifold_geometry(teacher_feats, y_train, a.manifold_samples_per_class,  # M2
+                             a.data_seed)
+    cap_d = max(2, min(BACKBONE_DIM[a.student], mgeo['capacity_width']))
+    safe_write_text(out / 'manifold_geometry.json', json.dumps(mgeo, indent=2))
+    print(f"Manifold geometry: R_M={mgeo['radius_mean']:.3f}, D_M={mgeo['dimension_mean']:.1f}, "
+          f"alpha_M={mgeo['capacity_alpha_M']:.3f}, rho_center={mgeo['center_correlation']:.3f} "
+          f"-> capacity width C/alpha_M = {mgeo['capacity_width']} (grid: {cap_d})")
 
     print(id_table.to_string(index=False))
     print(f"MLE d={mle_d} (stability {stab['mean']:.2f} +/- {stab['std']:.2f}) | "
@@ -1690,6 +1781,7 @@ def run():
         'pca_d': pca_d, 'pca_variance_threshold': a.pca_variance_threshold,
         'erank_d': erank_d,
         'ablation_raw_features': {'pca_d': pca_d_raw, 'erank_d': erank_d_raw},
+        'cap_d': cap_d, 'manifold_geometry': {k: v for k, v in mgeo.items() if k != 'per_class'},
         'fixed_widths': fixed_widths, 'fixed_width_grid': FIXED_WIDTHS_INDEPENDENT,
         'vlm_dim': vlm_dim,
         'split_sizes': {'train': int(len(train_ix)), 'test': int(len(test_ix))},
@@ -1704,7 +1796,7 @@ def run():
 
     # B5: parse dims with pca and erank tokens; fixed widths are always included
     full_d = BACKBONE_DIM[a.student]
-    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, full_d, fixed_widths)
+    dims = parse_dims(a.dims, mle_d, pca_d, erank_d, full_d, fixed_widths, cap_d)
     configs = [(m, d, s, 'linear') for s in seeds for d in dims for m in modes]
     if not a.no_identity_baseline:                                            # G1
         configs += [(m, full_d, s, 'identity') for s in seeds for m in modes]
@@ -1794,6 +1886,7 @@ def run():
 
     info = {'seeds': seeds, 'modes': modes, 'mle_d': mle_d, 'pca_d': pca_d, 'erank_d': erank_d,
             'pca_d_raw': pca_d_raw, 'erank_d_raw': erank_d_raw, 'fixed_widths': fixed_widths,
+            'cap_d': cap_d, 'manifold_geometry': {k: v for k, v in mgeo.items() if k != 'per_class'},
             'full_d': full_d, 'vlm_dim': vlm_dim, 'stab': stab, 'zs': zs,
             'split_sizes': {'train': int(len(train_ix)), 'test': int(len(test_ix))},
             'complete': complete, 'missing_tags': missing_tags,

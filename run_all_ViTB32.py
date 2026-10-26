@@ -26,11 +26,19 @@ from pathlib import Path
 # Datasets to run, in order. Comment out lines you do not want.
 # name: (training script, extra flags for that dataset)
 DATASETS = {
-    #'fmnist':         ('fmnist_vl2lite_mle_pareto_v8.py',       []),
-     'svhn':         ('svhn_vl2lite_mle_pareto_v8.py',         []),
+    'fmnist':         ('fmnist_vl2lite_mle_pareto_v8.py',       []),
+    # 'svhn':         ('svhn_vl2lite_mle_pareto_v8.py',         []),
     # 'cifar10':      ('cifar10_vl2lite_mle_pareto_v8.py',      []),
-    # 'cifar100':     ('cifar100_vl2lite_mle_pareto_v8.py',     []),
-    # 'tinyimagenet': ('tinyimagenet_vl2lite_mle_pareto_v8.py', []),
+    # CIFAR-100 passes its own --dims (adds 192, 256); it comes after the global DIMS
+    # on the command line, so it takes precedence.
+    # 'cifar100':     ('cifar100_vl2lite_mle_pareto_v8.py',
+    #                  ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256,'
+    #                             'mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
+    # Tiny ImageNet (200 classes) also passes the denser --dims; put the Kaggle zip or the
+    # extracted tiny-imagenet-200 folder in DATA_ROOT.
+    # 'tinyimagenet': ('tinyimagenet_vl2lite_mle_pareto_v8.py',
+    #                  ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256,'
+    #                             'mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
 }
 
 # Student models to run on every dataset.
@@ -39,22 +47,18 @@ DATASETS = {
 STUDENTS = [
     'resnet18',
     'mobilenet_v2',
-    'mobilenet_v3_large',
-    'efficientnet_b0',
-    'convnext_tiny',
-    'resnet50',
+    # 'mobilenet_v3_large',
+    # 'efficientnet_b0',
+    # 'convnext_tiny',
+    # 'resnet50',
 ]
-
-
-
-#STUDENTS = ['resnet50', 'convnext_tiny', 'efficientnet_b0', 'mobilenet_v3_large', 'mobilenet_v2', 'resnet18']
 
 # ── Core training settings ────────────────────────────────────────────────────
 # Fix 2: 50 epochs for convergence (v8 convergence check fires at 20)
-EPOCHS_DEFAULT = 1
+EPOCHS_DEFAULT = 5 #50
 
 # Fix 4: 3 seeds for variance analysis (single seed gives NaN std)
-SEEDS = '42'#'42,43,44'
+SEEDS = 42 #'42,43,44'
 
 # Fix 1: all 6 distillation modes including rkd, crd, dkd
 MODES = 'labels,feat,rkd,crd,dkd,vl2lite,sskd,clipkd'
@@ -62,7 +66,7 @@ MODES = 'labels,feat,rkd,crd,dkd,vl2lite,sskd,clipkd'
 # Fix 5: explicit dims so pca and erank tokens are always passed
 # Grid starts at 2 so a plateau at the smallest width can be detected (d_1pp < 8)
 DIMS = ('2,4,8,12,16,24,32,48,64,96,128,'
-        'mle*0.5,mle*0.75,mle,pca,erank,mle*1.25,mle*1.5,full')
+        'mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full')
 
 # Ablations: each gets its own output folder. 'main' uses student-only augmentation;
 # 'matched_views' trains on un-augmented images, so teacher and student see the same view.
@@ -89,7 +93,7 @@ def out_folder(dataset: str, student: str, epochs: int, ablation: str = 'main') 
     return Path(RESULTS_ROOT) / f'{dataset}_{student}_e{epochs}{suffix}'
 
 
-def run_state(out: Path, dataset: str, student: str) -> str:
+def run_state(out: Path) -> str:
     """Return 'done', 'resume', or 'new' for an output folder.
 
     'done'   — final analysis exists, is marked complete, nothing is missing, and it
@@ -99,8 +103,8 @@ def run_state(out: Path, dataset: str, student: str) -> str:
                never count as finished.
     'new'    — nothing exists yet.
     """
-    summary_csv  = out / f'{dataset}_{student}_pareto_summary.csv'
-    per_seed_csv = out / f'{dataset}_{student}_results_per_seed.csv'
+    summary_csv  = out / 'pareto_summary.csv'
+    per_seed_csv = out / 'results_per_seed.csv'
 
     # A partial analysis (--allow-partial) writes complete: false; never treat it as done.
     try:
@@ -167,7 +171,9 @@ def build_command(dataset: str, student: str, epochs: int, out: Path, resume: bo
     cmd += list(ABLATIONS[ablation])
     if resume:
         cmd.append('--resume')
-    return cmd
+    # subprocess on Windows accepts only text: convert numbers and Paths in any setting
+    # (e.g. GPUS = 0, SEEDS = 42 or EXTRA_FLAGS = ['--max-train', 2000]).
+    return [str(c) for c in cmd]
 
 
 def run_and_log(cmd: list, log_path: Path) -> int:
@@ -195,6 +201,28 @@ def print_separator(char='=', width=78):
     print(char * width)
 
 
+def check_settings():
+    """Report settings written as numbers. They are converted to text automatically,
+    but a number can hide a typo, so they are listed once at start-up."""
+    notes = []
+    for name in ('SEEDS', 'MODES', 'DIMS', 'GPUS', 'DATA_ROOT', 'RESULTS_ROOT'):
+        v = globals()[name]
+        if not isinstance(v, (str, Path)):
+            notes.append(f'{name} = {v!r}')
+    lists = {'EXTRA_FLAGS': EXTRA_FLAGS, **{f'ABLATIONS[{k!r}]': v for k, v in ABLATIONS.items()},
+             **{f'DATASETS[{k!r}] flags': v[1] for k, v in DATASETS.items()}}
+    for name, items in lists.items():
+        if not isinstance(items, (list, tuple)):
+            sys.exit(f'Setting error: {name} must be a list, e.g. [\'--max-train\', \'2000\'], '
+                     f'got {items!r}')
+        bad = [x for x in items if not isinstance(x, (str, Path))]
+        if bad:
+            notes.append(f'{name} contains {bad!r}')
+    if notes:
+        print('Note: these settings are not text and will be converted with str():\n  '
+              + '\n  '.join(notes))
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -211,6 +239,7 @@ def main():
         sys.exit(f'Training script(s) not found in {Path.cwd()}:\n  ' +
                  '\n  '.join(missing))
 
+    check_settings()
     jobs = [(dataset, student, abl) for abl in ABLATIONS for dataset in DATASETS
             for student in STUDENTS]
     Path(RESULTS_ROOT).mkdir(parents=True, exist_ok=True)
@@ -233,7 +262,7 @@ def main():
     for i, (dataset, student, ablation) in enumerate(jobs, 1):
         epochs = EPOCHS_DEFAULT
         out    = out_folder(dataset, student, epochs, ablation)
-        state  = run_state(out,dataset,student)
+        state  = run_state(out)
         script = DATASETS[dataset][0]
         resume = (state == 'resume')
         cmd    = build_command(dataset, student, epochs, out, resume=resume, ablation=ablation)
