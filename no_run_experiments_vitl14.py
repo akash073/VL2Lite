@@ -49,13 +49,6 @@ TEACHERS = {
     # 'vitb32': {'model': 'ViT-B-32', 'pretrained': 'laion2b_s34b_b79k', 'dim': 512},
 }
 
-# Names of the command-line flags your training scripts use for the teacher.
-# CHANGE THESE if your scripts use different argument names.
-TEACHER_FLAGS = {
-    'model':      '--clip-model',
-    'pretrained': '--clip-pretrained',
-}
-
 # Student models to run on every dataset.
 # Options: resnet18, resnet50, mobilenet_v2, mobilenet_v3_large, efficientnet_b0, convnext_tiny
 STUDENTS = [
@@ -154,8 +147,8 @@ def build_command(teacher: str, dataset: str, student: str, epochs: int, out: Pa
     t = TEACHERS[teacher]
     cmd = [
         sys.executable, '-u', script,
-        TEACHER_FLAGS['model'],      t['model'],
-        TEACHER_FLAGS['pretrained'], t['pretrained'],
+        '--teacher',      t['model'],
+        '--pretrained', t['pretrained'],
         '--student',     student,
         '--epochs',      epochs,
         '--seeds',       SEEDS,
