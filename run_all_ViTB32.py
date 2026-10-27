@@ -42,15 +42,15 @@ DATASETS = {
 }
 
 # Student models to run on every dataset.
-# Options: resnet18, resnet50, mobilenet_v2, mobilenet_v3_large,
-#          efficientnet_b0, convnext_tiny
+# Options: resnet18, resnet50, mobilenet_v2, mobilenet_v3_large, efficientnet_b0, convnext_tiny
+
+
+# ONLY lighwieght 
 STUDENTS = [
     'resnet18',
     'mobilenet_v2',
-    # 'mobilenet_v3_large',
-    # 'efficientnet_b0',
-    # 'convnext_tiny',
-    # 'resnet50',
+    'efficientnet_b0',
+
 ]
 
 # ── Core training settings ────────────────────────────────────────────────────
@@ -72,11 +72,11 @@ DIMS = ('2,4,8,12,16,24,32,48,64,96,128,'
 # 'matched_views' trains on un-augmented images, so teacher and student see the same view.
 ABLATIONS = {
     'main':          [],
-    'matched_views': ['--no-augment'],
+    #'matched_views': ['--no-augment'],
 }
 
 GPUS = '0'          # e.g. '0,1' for two GPUs
-NUM_WORKERS = 2     # dataloader workers per run
+NUM_WORKERS = 4     # dataloader workers per run
 
 # Extra flags added to EVERY run — add ablations here if needed
 # e.g. ['--label-smoothing', '0', '--no-augment']
@@ -165,6 +165,7 @@ def build_command(dataset: str, student: str, epochs: int, out: Path, resume: bo
         '--num-workers', str(NUM_WORKERS),
         '--data-root',   DATA_ROOT,
         '--out',         str(out),
+        '--max-train', 2000
     ]
     cmd += list(dataset_flags)
     cmd += list(EXTRA_FLAGS)
