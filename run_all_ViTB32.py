@@ -28,7 +28,7 @@ from pathlib import Path
 DATASETS = {
     'fmnist':         ('fmnist_vl2lite_mle_pareto_v8.py',       []),
     # 'svhn':         ('svhn_vl2lite_mle_pareto_v8.py',         []),
-    # 'cifar10':      ('cifar10_vl2lite_mle_pareto_v8.py',      []),
+    'cifar10':      ('cifar10_vl2lite_mle_pareto_v8.py',      []),
     # CIFAR-100 passes its own --dims (adds 192, 256); it comes after the global DIMS
     # on the command line, so it takes precedence.
     # 'cifar100':     ('cifar100_vl2lite_mle_pareto_v8.py',
@@ -47,15 +47,15 @@ DATASETS = {
 
 # ONLY lighwieght 
 STUDENTS = [
-    'resnet18',
-    'mobilenet_v2',
+    # 'resnet18',
+    # 'mobilenet_v2',
     'efficientnet_b0',
 
 ]
 
 # ── Core training settings ────────────────────────────────────────────────────
 # Fix 2: 50 epochs for convergence (v8 convergence check fires at 20)
-EPOCHS_DEFAULT = 50 #50
+EPOCHS_DEFAULT = 5 #50
 
 # Fix 4: 3 seeds for variance analysis (single seed gives NaN std)
 SEEDS = 42 #'42,43,44'
@@ -165,7 +165,6 @@ def build_command(dataset: str, student: str, epochs: int, out: Path, resume: bo
         '--num-workers', str(NUM_WORKERS),
         '--data-root',   DATA_ROOT,
         '--out',         str(out),
-        '--max-train', 2000
     ]
     cmd += list(dataset_flags)
     cmd += list(EXTRA_FLAGS)

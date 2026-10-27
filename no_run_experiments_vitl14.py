@@ -65,7 +65,7 @@ STUDENTS = [
 ]
 
 # ── Core training settings ────────────────────────────────────────────────────
-EPOCHS_DEFAULT = 50          # use a small value (e.g. 5) only for quick tests
+EPOCHS_DEFAULT = 5          # use a small value (e.g. 5) only for quick tests
 SEEDS = '42'           # three seeds so standard deviations are defined
 MODES = 'labels,feat,rkd,crd,dkd,vl2lite,sskd,clipkd'
 
