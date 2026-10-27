@@ -55,7 +55,7 @@ STUDENTS = [
 
 # ── Core training settings ────────────────────────────────────────────────────
 # Fix 2: 50 epochs for convergence (v8 convergence check fires at 20)
-EPOCHS_DEFAULT = 5 #50
+EPOCHS_DEFAULT = 50 #50
 
 # Fix 4: 3 seeds for variance analysis (single seed gives NaN std)
 SEEDS = 42 #'42,43,44'
