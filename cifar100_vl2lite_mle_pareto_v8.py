@@ -130,7 +130,9 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, models, transforms
-mp.set_sharing_strategy("file_system")
+
+
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 CIFAR100_CLASSES = [
