@@ -149,6 +149,8 @@ import zipfile
 from PIL import Image
 from torchvision import models, transforms
 
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 # TIN-2: class names come from words.txt at runtime; prompt names are built per class
 PROMPT_TEMPLATES = ['a photo of {}.', 'a blurry photo of {}.',
                     'a low resolution photo of {}.', 'a close-up photo of {}.']
