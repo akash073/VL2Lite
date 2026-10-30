@@ -127,6 +127,9 @@ from sklearn.neighbors import NearestNeighbors
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, models, transforms
 
+
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 CIFAR10_CLASSES = ['airplane', 'automobile', 'bird', 'cat', 'deer',
                    'dog', 'frog', 'horse', 'ship', 'truck']
 PROMPT_NAMES = ['an airplane', 'an automobile', 'a bird', 'a cat', 'a deer',
