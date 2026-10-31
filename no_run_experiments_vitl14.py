@@ -30,11 +30,12 @@ from pathlib import Path
 # Datasets to run, in order. Comment out lines you do not want.
 # name: (training script, extra flags for that dataset)
 DATASETS = {
-     'fmnist':         ('fmnist_vl2lite_mle_pareto_v8.py',       []),
+     #'fmnist':         ('fmnist_vl2lite_mle_pareto_v8.py',       []),
+     'kmnist':         ('kmnist_vl2lite_mle_pareto_v8.py',       []),
      #'svhn':         ('svhn_vl2lite_mle_pareto_v8.py',         []),
      #'cifar10':      ('cifar10_vl2lite_mle_pareto_v8.py',      []),
      #'cifar100':     ('cifar100_vl2lite_mle_pareto_v8.py', ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256, mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
-     'tinyimagenet': ('tinyimagenet_vl2lite_mle_pareto_v8.py', ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256, mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
+     #'tinyimagenet': ('tinyimagenet_vl2lite_mle_pareto_v8.py', ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256, mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
 }
 
 # ── Teacher(s) ────────────────────────────────────────────────────────────────
@@ -42,10 +43,10 @@ DATASETS = {
 # Keys are short tags used in folder names. Uncomment 'vitb32' to run both teachers.
 TEACHERS = {
 
-    'vith14': {'model': 'ViT-H-14', 'pretrained': 'laion2b_s32b_b79k', 'dim': 1024},
+    #'vith14': {'model': 'ViT-H-14', 'pretrained': 'laion2b_s32b_b79k', 'dim': 1024},
 
     #'vitl14': {'model': 'ViT-L-14', 'pretrained': 'laion2b_s32b_b82k', 'dim': 768},
-    # 'vitb32': {'model': 'ViT-B-32', 'pretrained': 'laion2b_s34b_b79k', 'dim': 512},
+     'vitb32': {'model': 'ViT-B-32', 'pretrained': 'laion2b_s34b_b79k', 'dim': 512},
 }
 
 # Student models to run on every dataset.

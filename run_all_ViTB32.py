@@ -27,14 +27,14 @@ from pathlib import Path
 # name: (training script, extra flags for that dataset)
 DATASETS = {
     'fmnist':         ('fmnist_vl2lite_mle_pareto_v8.py',       []),
-    'svhn':         ('svhn_vl2lite_mle_pareto_v8.py',         []),
-    'cifar10':      ('cifar10_vl2lite_mle_pareto_v8.py',      []),
+    #'svhn':         ('svhn_vl2lite_mle_pareto_v8.py',         []),
+    #'cifar10':      ('cifar10_vl2lite_mle_pareto_v8.py',      []),
     # CIFAR-100 passes its own --dims (adds 192, 256); it comes after the global DIMS
     # on the command line, so it takes precedence.
-     'cifar100':     ('cifar100_vl2lite_mle_pareto_v8.py',                 ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256,mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
+    # 'cifar100':     ('cifar100_vl2lite_mle_pareto_v8.py',                 ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256,mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
     # Tiny ImageNet (200 classes) also passes the denser --dims; put the Kaggle zip or the
     # extracted tiny-imagenet-200 folder in DATA_ROOT.
-    'tinyimagenet': ('tinyimagenet_vl2lite_mle_pareto_v8.py', ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256,mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
+    #'tinyimagenet': ('tinyimagenet_vl2lite_mle_pareto_v8.py', ['--dims', '2,4,8,12,16,24,32,48,64,96,128,192,256,mle*0.5,mle*0.75,mle,pca,erank,cap,mle*1.25,mle*1.5,full']),
 }
 
 # Student models to run on every dataset.
@@ -46,6 +46,7 @@ STUDENTS = [
     # 'resnet18',
     # 'mobilenet_v2',
     #'efficientnet_b0',
+    'convnext_tiny'
 
 ]
 
